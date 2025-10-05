@@ -46,7 +46,9 @@
 
       recorder.onstop = async () => {
         console.log("⏳ Пересборка WebM через Mediabunny...");
+        const t0 = performance.now();
         const fixedBlob = await rebuildWebM(chunks);
+        const t1 = performance.now();
         const url = URL.createObjectURL(fixedBlob);
         result.src = url;
 
@@ -59,6 +61,7 @@
         a.click();
         a.remove();
 
+        console.log(`⏱️ rebuildWebM заняло ${(t1 - t0).toFixed(1)} мс`);
         console.log("✅ Готово, файл скачан и доступен для просмотра");
       };
 
