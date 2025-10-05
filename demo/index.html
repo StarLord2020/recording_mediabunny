@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Mediabunny + Screen Recording Demo</title>
+  <script src="../dist/mediabunny.umd.js"></script>
+  <style>
+    video { width: 480px; margin: 10px; background: #000; }
+    button { margin: 10px; padding: 8px 14px; }
+  </style>
+  <!--
+    После сборки (npm install && npm run build) подключаем dist/mediabunny.umd.js.
+    Глобал доступен как window.Mediabunny
+  -->
+  
+</head>
+<body>
+  <h2>🎬 Пример записи экрана и сборки WebM с Mediabunny (UMD)</h2>
+
+  <video id="preview" autoplay muted></video><br>
+  <button id="startBtn">▶️ Начать запись экрана</button>
+  <button id="stopBtn" disabled>⏹️ Остановить</button>
+
+  <h3>Результат:</h3>
+  <video id="result" controls></video>
+
+  <script>
+    const preview = document.getElementById('preview');
+    const result = document.getElementById('result');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+
+    let recorder, chunks = [];
+
+    async function startRecording() {
+      // Захват только экрана. Поставьте audio: true, если нужен системный звук (поддерживается не во всех браузерах)
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      preview.srcObject = stream;
+
+      recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs=vp9,opus' });
+      chunks = [];
+
+      recorder.ondataavailable = e => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        console.log("⏳ Пересборка WebM через Mediabunny...");
+        const fixedBlob = await rebuildWebM(chunks);
+        const url = URL.createObjectURL(fixedBlob);
+        result.src = url;
+
+        // Автоскачивание результата
+        const a = document.createElement('a');
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        a.href = url;
+        a.download = `screen-recording-${ts}.webm`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+        console.log("✅ Готово, файл скачан и доступен для просмотра");
+      };
+
+      // Если пользователь остановит шаринг через UI браузера, завершим запись
+      const [vtrack] = stream.getVideoTracks();
+      if (vtrack) vtrack.onended = () => { if (recorder && recorder.state === 'recording') stopRecording(); };
+
+      recorder.start(1000); // писать чанками по 1с
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+    }
+
+    function stopRecording() {
+      recorder.stop();
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      preview.srcObject.getTracks().forEach(t => t.stop());
+    }
+
+    async function rebuildWebM(chunks) {
+      const { Input, Output, WebMOutputFormat, BufferTarget, BlobSource, WEBM, Conversion } = window.Mediabunny;
+
+      const fullBlob = new Blob(chunks, { type: 'video/webm' });
+      const input = new Input({ source: new BlobSource(fullBlob), formats: [WEBM] });
+
+      const target = new BufferTarget();
+      const output = new Output({ format: new WebMOutputFormat(), target });
+
+      const conversion = await Conversion.init({ input, output });
+      await conversion.execute();
+
+      const buffer = target.buffer;
+      return new Blob([buffer], { type: 'video/webm' });
+    }
+
+    startBtn.onclick = startRecording;
+    stopBtn.onclick = stopRecording;
+  </script>
+</body>
+</html>

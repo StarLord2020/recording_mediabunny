@@ -1,0 +1,16 @@
+{
+  "name": "mediabunny-umd",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "UMD bundle wrapper for mediabunny with a no-bundler browser demo",
+  "scripts": {
+    "build": "rollup -c"
+  },
+  "dependencies": {
+    "@rollup/plugin-commonjs": "^28.0.6",
+    "@rollup/plugin-node-resolve": "^16.0.2",
+    "mediabunny": "^1.23.0",
+    "rollup": "^4.52.4"
+  }
+}
