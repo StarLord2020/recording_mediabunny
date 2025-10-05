@@ -7,6 +7,12 @@
   <style>
     video { width: 480px; margin: 10px; background: #000; }
     button { margin: 10px; padding: 8px 14px; }
+    .progress {
+      position: relative; width: 480px; height: 10px; background: #eee; margin: 10px; border-radius: 6px; overflow: hidden;
+      box-shadow: inset 0 1px 2px rgba(0,0,0,0.15);
+    }
+    .progress__bar { height: 100%; width: 0%; background: linear-gradient(90deg,#4caf50,#2e7d32); transition: width 0.1s ease; }
+    .progress__text { font: 12px system-ui, sans-serif; margin: 0 10px; color: #333; }
   </style>
   <!--
     После сборки (npm install && npm run build) подключаем dist/mediabunny.umd.js.
@@ -21,6 +27,11 @@
   <button id="startBtn">▶️ Начать запись экрана</button>
   <button id="stopBtn" disabled>⏹️ Остановить</button>
 
+  <div class="progress" id="progress" style="display:none">
+    <div class="progress__bar" id="progressBar"></div>
+  </div>
+  <div class="progress__text" id="progressText" style="display:none">0%</div>
+
   <h3>Результат:</h3>
   <video id="result" controls></video>
 
@@ -29,6 +40,9 @@
     const result = document.getElementById('result');
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
+    const progressEl = document.getElementById('progress');
+    const progressBarEl = document.getElementById('progressBar');
+    const progressTextEl = document.getElementById('progressText');
 
     let recorder, chunks = [];
 
@@ -46,6 +60,10 @@
 
       recorder.onstop = async () => {
         console.log("⏳ Пересборка WebM через Mediabunny...");
+        // Показать прогресс
+        progressEl.style.display = '';
+        progressTextEl.style.display = '';
+        updateProgress(0);
         const t0 = performance.now();
         const fixedBlob = await rebuildWebM(chunks);
         const t1 = performance.now();
@@ -63,6 +81,9 @@
 
         console.log(`⏱️ rebuildWebM заняло ${(t1 - t0).toFixed(1)} мс`);
         console.log("✅ Готово, файл скачан и доступен для просмотра");
+        // Скрыть прогресс
+        updateProgress(1);
+        setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600);
       };
 
       // Если пользователь остановит шаринг через UI браузера, завершим запись
@@ -91,6 +112,11 @@
       const output = new Output({ format: new WebMOutputFormat(), target });
 
       const conversion = await Conversion.init({ input, output });
+      conversion.onProgress = (p) => {
+        const percent = Math.max(0, Math.min(1, p));
+        updateProgress(percent);
+        console.log(`📈 Mediabunny progress: ${(percent * 100).toFixed(1)}%`);
+      };
       await conversion.execute();
 
       const buffer = target.buffer;
@@ -99,6 +125,12 @@
 
     startBtn.onclick = startRecording;
     stopBtn.onclick = stopRecording;
+
+    function updateProgress(p) {
+      const clamped = Math.max(0, Math.min(1, p));
+      progressBarEl.style.width = `${(clamped*100).toFixed(1)}%`;
+      progressTextEl.textContent = `${(clamped*100).toFixed(1)}%`;
+    }
   </script>
 </body>
 </html>
