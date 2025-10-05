@@ -26,6 +26,9 @@
   <video id="preview" autoplay muted></video><br>
   <button id="startBtn">▶️ Начать запись экрана</button>
   <button id="stopBtn" disabled>⏹️ Остановить</button>
+  <label style="margin-left:10px; font: 13px system-ui, sans-serif;">
+    <input type="checkbox" id="saveToFile"> Сохранять напрямую в файл (Chrome/Edge)
+  </label>
 
   <div id="recInfo" style="display:none; margin: 0 10px; font: 13px system-ui, sans-serif; color:#b71c1c;">
     <span style="display:inline-block; width:10px; height:10px; background:#e53935; border-radius:50%; margin-right:6px; vertical-align:middle;"></span>
@@ -53,6 +56,7 @@
     let recTimerId = null;
     let recStartMs = 0;
     let worker = null;
+    let fsWritable = null; // FileSystemWritableFileStream
 
     async function startRecording() {
       // Захват экрана + системного звука (если поддерживается браузером)
@@ -74,9 +78,10 @@
 
         const t0 = performance.now();
 
-        // Предпочитаем Web Worker, фолбэк — inline
+        // Предпочитаем Web Worker; если выбран режим прямой записи — стримим в файл
         if (window.Worker) {
-          await remuxInWorker(chunks, 'video/webm', t0);
+          const streamToFile = !!(fsWritable && window.showSaveFilePicker);
+          await remuxInWorker(chunks, 'video/webm', t0, streamToFile);
         } else {
           const fixedBlob = await rebuildWebM(chunks);
           handleReadyBlob(fixedBlob, performance.now() - t0);
@@ -101,7 +106,18 @@
       }, 250);
     }
 
-    function stopRecording() {
+    async function stopRecording() {
+      if (document.getElementById('saveToFile').checked && window.showSaveFilePicker && !fsWritable) {
+        try {
+          const handle = await window.showSaveFilePicker({
+            suggestedName: `screen-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`,
+            types: [{ description: 'WebM Video', accept: { 'video/webm': ['.webm'] } }]
+          });
+          fsWritable = await handle.createWritable();
+        } catch (e) {
+          console.warn('Выбор файла отменён или ошибка FS API:', e);
+        }
+      }
       recorder.stop();
       startBtn.disabled = false;
       stopBtn.disabled = true;
@@ -148,30 +164,68 @@
       document.getElementById('recTime').textContent = `${m}:${s}`;
     }
 
-    async function remuxInWorker(chunks, mimeType, t0) {
+    async function remuxInWorker(chunks, mimeType, t0, streamToFile) {
       try {
         if (worker) { worker.terminate(); worker = null; }
         worker = new Worker('remux.worker.js');
         await new Promise((resolve, reject) => {
-          worker.onmessage = (ev) => {
+          worker.onmessage = async (ev) => {
             const { type } = ev.data || {};
             if (type === 'progress') {
               const p = Math.max(0, Math.min(1, ev.data.progress || 0));
               updateProgress(p);
               console.log(`📈 Mediabunny progress (worker): ${(p * 100).toFixed(1)}%`);
             } else if (type === 'done') {
-              const buffer = ev.data.buffer; // ArrayBuffer (transferable)
-              const blob = new Blob([buffer], { type: 'video/webm' });
               const elapsed = typeof ev.data.elapsedMs === 'number' ? ev.data.elapsedMs : (performance.now() - t0);
-              handleReadyBlob(blob, elapsed);
-              resolve();
+              if (ev.data.streamed) {
+                try { if (fsWritable) await fsWritable.close(); } catch (e) {}
+                fsWritable = null;
+                console.log(`⏱️ rebuildWebM заняло ${elapsed.toFixed(1)} мс`);
+                console.log('✅ Готово, файл сохранён');
+                updateProgress(1);
+                setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600);
+                resolve();
+              } else {
+                const buffer = ev.data.buffer; // ArrayBuffer (transferable)
+                const blob = new Blob([buffer], { type: 'video/webm' });
+                handleReadyBlob(blob, elapsed);
+                resolve();
+              }
             } else if (type === 'error') {
               console.error('Remux worker error:', ev.data.message);
               reject(new Error(ev.data.message));
             }
           };
           worker.onerror = (err) => reject(err);
-          worker.postMessage({ chunks, mimeType });
+
+          if (streamToFile) {
+            if (!fsWritable) { reject(new Error('No writable handle')); return; }
+            const channel = new MessageChannel();
+            channel.port1.onmessage = async (msg) => {
+              const d = msg.data || {};
+              try {
+                if (d.type === 'write') {
+                  const u8 = new Uint8Array(d.data);
+                  await fsWritable.write(u8);
+                  channel.port1.postMessage({ type: 'ack', id: d.id });
+                } else if (d.type === 'close') {
+                  await fsWritable.close();
+                  fsWritable = null;
+                  channel.port1.postMessage({ type: 'ack', id: d.id });
+                } else if (d.type === 'abort') {
+                  try { await fsWritable.abort?.(); } catch (_) {}
+                  try { await fsWritable.close(); } catch (_) {}
+                  fsWritable = null;
+                  channel.port1.postMessage({ type: 'ack', id: d.id });
+                }
+              } catch (err) {
+                channel.port1.postMessage({ type: 'nack', id: d.id, message: String(err) });
+              }
+            };
+            worker.postMessage({ mode: 'stream', chunks, mimeType, port: channel.port2 }, [channel.port2]);
+          } else {
+            worker.postMessage({ mode: 'buffer', chunks, mimeType });
+          }
         });
       } catch (err) {
         console.warn('Falling back to inline remux due to worker error:', err);
