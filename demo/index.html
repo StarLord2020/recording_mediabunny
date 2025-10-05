@@ -27,6 +27,11 @@
   <button id="startBtn">▶️ Начать запись экрана</button>
   <button id="stopBtn" disabled>⏹️ Остановить</button>
 
+  <div id="recInfo" style="display:none; margin: 0 10px; font: 13px system-ui, sans-serif; color:#b71c1c;">
+    <span style="display:inline-block; width:10px; height:10px; background:#e53935; border-radius:50%; margin-right:6px; vertical-align:middle;"></span>
+    Идёт запись: <span id="recTime">0:00</span>
+  </div>
+
   <div class="progress" id="progress" style="display:none">
     <div class="progress__bar" id="progressBar"></div>
   </div>
@@ -45,6 +50,8 @@
     const progressTextEl = document.getElementById('progressText');
 
     let recorder, chunks = [];
+    let recTimerId = null;
+    let recStartMs = 0;
 
     async function startRecording() {
       // Захват экрана + системного звука (если поддерживается браузером)
@@ -93,6 +100,15 @@
       recorder.start(1000); // писать чанками по 1с
       startBtn.disabled = true;
       stopBtn.disabled = false;
+
+      // Показать индикатор записи и обновлять таймер
+      recStartMs = performance.now();
+      document.getElementById('recInfo').style.display = '';
+      updateRecTime(0);
+      recTimerId = setInterval(() => {
+        const ms = performance.now() - recStartMs;
+        updateRecTime(ms);
+      }, 250);
     }
 
     function stopRecording() {
@@ -100,6 +116,9 @@
       startBtn.disabled = false;
       stopBtn.disabled = true;
       preview.srcObject.getTracks().forEach(t => t.stop());
+
+      if (recTimerId) { clearInterval(recTimerId); recTimerId = null; }
+      document.getElementById('recInfo').style.display = 'none';
     }
 
     async function rebuildWebM(chunks) {
@@ -130,6 +149,13 @@
       const clamped = Math.max(0, Math.min(1, p));
       progressBarEl.style.width = `${(clamped*100).toFixed(1)}%`;
       progressTextEl.textContent = `${(clamped*100).toFixed(1)}%`;
+    }
+
+    function updateRecTime(ms) {
+      const totalSec = Math.max(0, Math.floor(ms / 1000));
+      const m = Math.floor(totalSec / 60).toString();
+      const s = (totalSec % 60).toString().padStart(2,'0');
+      document.getElementById('recTime').textContent = `${m}:${s}`;
     }
   </script>
 </body>
