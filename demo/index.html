@@ -52,6 +52,7 @@
     let recorder, chunks = [];
     let recTimerId = null;
     let recStartMs = 0;
+    let worker = null;
 
     async function startRecording() {
       // Захват экрана + системного звука (если поддерживается браузером)
@@ -66,31 +67,20 @@
       };
 
       recorder.onstop = async () => {
-        console.log("⏳ Пересборка WebM через Mediabunny...");
-        // Показать прогресс
+        console.log("⏳ Пересборка WebM (remux) в фоновом потоке...");
         progressEl.style.display = '';
         progressTextEl.style.display = '';
         updateProgress(0);
+
         const t0 = performance.now();
-        const fixedBlob = await rebuildWebM(chunks);
-        const t1 = performance.now();
-        const url = URL.createObjectURL(fixedBlob);
-        result.src = url;
 
-        // Автоскачивание результата
-        const a = document.createElement('a');
-        const ts = new Date().toISOString().replace(/[:.]/g, '-');
-        a.href = url;
-        a.download = `screen-recording-${ts}.webm`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-
-        console.log(`⏱️ rebuildWebM заняло ${(t1 - t0).toFixed(1)} мс`);
-        console.log("✅ Готово, файл скачан и доступен для просмотра");
-        // Скрыть прогресс
-        updateProgress(1);
-        setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600);
+        // Предпочитаем Web Worker, фолбэк — inline
+        if (window.Worker) {
+          await remuxInWorker(chunks, 'video/webm', t0);
+        } else {
+          const fixedBlob = await rebuildWebM(chunks);
+          handleReadyBlob(fixedBlob, performance.now() - t0);
+        }
       };
 
       // Если пользователь остановит шаринг через UI браузера, завершим запись
@@ -156,6 +146,60 @@
       const m = Math.floor(totalSec / 60).toString();
       const s = (totalSec % 60).toString().padStart(2,'0');
       document.getElementById('recTime').textContent = `${m}:${s}`;
+    }
+
+    async function remuxInWorker(chunks, mimeType, t0) {
+      try {
+        if (worker) { worker.terminate(); worker = null; }
+        worker = new Worker('remux.worker.js');
+        await new Promise((resolve, reject) => {
+          worker.onmessage = (ev) => {
+            const { type } = ev.data || {};
+            if (type === 'progress') {
+              const p = Math.max(0, Math.min(1, ev.data.progress || 0));
+              updateProgress(p);
+              console.log(`📈 Mediabunny progress (worker): ${(p * 100).toFixed(1)}%`);
+            } else if (type === 'done') {
+              const buffer = ev.data.buffer; // ArrayBuffer (transferable)
+              const blob = new Blob([buffer], { type: 'video/webm' });
+              const elapsed = typeof ev.data.elapsedMs === 'number' ? ev.data.elapsedMs : (performance.now() - t0);
+              handleReadyBlob(blob, elapsed);
+              resolve();
+            } else if (type === 'error') {
+              console.error('Remux worker error:', ev.data.message);
+              reject(new Error(ev.data.message));
+            }
+          };
+          worker.onerror = (err) => reject(err);
+          worker.postMessage({ chunks, mimeType });
+        });
+      } catch (err) {
+        console.warn('Falling back to inline remux due to worker error:', err);
+        const fixedBlob = await rebuildWebM(chunks);
+        handleReadyBlob(fixedBlob, performance.now() - t0);
+      } finally {
+        if (worker) { worker.terminate(); worker = null; }
+      }
+    }
+
+    function handleReadyBlob(fixedBlob, elapsedMs) {
+      const url = URL.createObjectURL(fixedBlob);
+      result.src = url;
+
+      // Автоскачивание результата
+      const a = document.createElement('a');
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      a.href = url;
+      a.download = `screen-recording-${ts}.webm`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      console.log(`⏱️ rebuildWebM заняло ${elapsedMs.toFixed(1)} мс`);
+      console.log('✅ Готово, файл скачан и доступен для просмотра');
+      // Скрыть прогресс
+      updateProgress(1);
+      setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600);
     }
   </script>
 </body>
