@@ -33,8 +33,8 @@
     let recorder, chunks = [];
 
     async function startRecording() {
-      // Захват только экрана. Поставьте audio: true, если нужен системный звук (поддерживается не во всех браузерах)
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      // Захват экрана + системного звука (если поддерживается браузером)
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       preview.srcObject = stream;
 
       recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs=vp9,opus' });
