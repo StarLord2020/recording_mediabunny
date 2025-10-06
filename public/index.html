@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <title>Mediabunny + Screen Recording Demo</title>
   <script src="./mediabunny.umd.js"></script>
+  <script src="./idb-recorder.js"></script>
   <style>
     video { width: 480px; margin: 10px; background: #000; }
     button { margin: 10px; padding: 8px 14px; }
@@ -55,17 +56,30 @@
     let recStartMs = 0;
     let worker = null;
     let fsWritable = null; // FileSystemWritableFileStream
+    let idbWriter = null;  // IndexedDB writer
 
     async function startRecording() {
       // Захват экрана + системного звука (если поддерживается браузером)
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       preview.srcObject = stream;
 
+      // Инициализация MediaRecorder
       recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs=vp9,opus' });
+      // Инициализация IndexedDB-сессии (не блокируем UI)
+      try {
+        idbWriter = new IDBWriter();
+        idbRequestPersistence?.();
+        await idbWriter.start({ filenameBase: 'screen-recording', mimeType: 'video/webm', roomId: undefined });
+      } catch (e) {
+        console.warn('IDB session init failed:', e);
+        idbWriter = null;
+      }
       chunks = [];
 
       recorder.ondataavailable = e => {
         if (e.data.size > 0) chunks.push(e.data);
+        // Пишем чанк в IndexedDB, если доступно
+        try { idbWriter?.enqueue(e.data); } catch (_) {}
       };
 
       recorder.onstop = async () => {
@@ -146,6 +160,10 @@
 
       if (recTimerId) { clearInterval(recTimerId); recTimerId = null; }
       document.getElementById('recInfo').style.display = 'none';
+
+      // Завершаем IDB-сессию (не блокируем критический путь)
+      try { await idbWriter?.stop(); } catch (e) { console.warn('IDB stop failed:', e); }
+      idbWriter = null;
     }
 
     async function rebuildWebM(chunks) {
