@@ -172,7 +172,8 @@
     async function remuxInWorker(chunks, mimeType, t0, streamToFile) {
       try {
         if (worker) { worker.terminate(); worker = null; }
-        worker = new Worker('remux.worker.js');
+        // Bust worker cache to ensure latest code
+        worker = new Worker(`remux.worker.js?v=${Date.now()}`);
         await new Promise((resolve, reject) => {
           worker.onmessage = async (ev) => {
             const { type } = ev.data || {};
