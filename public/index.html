@@ -133,6 +133,7 @@
     }
 
     async function rebuildWebM(chunks) {
+      console.log
       const { Input, Output, WebMOutputFormat, BufferTarget, BlobSource, WEBM, Conversion } = window.Mediabunny;
 
       const fullBlob = new Blob(chunks, { type: 'video/webm' });
@@ -150,6 +151,7 @@
       await conversion.execute();
 
       const buffer = target.buffer;
+      console.log(target, 'target target target');
       return new Blob([buffer], { type: 'video/webm' });
     }
 
@@ -211,7 +213,11 @@
               try {
                 if (d.type === 'write') {
                   const u8 = new Uint8Array(d.data);
-                  await fsWritable.write(u8);
+                  if (typeof d.position === 'number') {
+                    await fsWritable.write({ type: 'write', position: d.position, data: u8 });
+                  } else {
+                    await fsWritable.write(u8);
+                  }
                   channel.port1.postMessage({ type: 'ack', id: d.id });
                 } else if (d.type === 'close') {
                   await fsWritable.close();
