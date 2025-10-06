@@ -40,12 +40,10 @@
   </div>
   <div class="progress__text" id="progressText" style="display:none">0%</div>
 
-  <h3>Результат:</h3>
-  <video id="result" controls></video>
+  <!-- Результат не отображаем во встроенном плеере, экономим память -->
 
   <script>
     const preview = document.getElementById('preview');
-    const result = document.getElementById('result');
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
     const progressEl = document.getElementById('progress');
@@ -121,7 +119,10 @@
       recorder.stop();
       startBtn.disabled = false;
       stopBtn.disabled = true;
-      preview.srcObject.getTracks().forEach(t => t.stop());
+      if (preview.srcObject) {
+        preview.srcObject.getTracks().forEach(t => t.stop());
+        preview.srcObject = null;
+      }
 
       if (recTimerId) { clearInterval(recTimerId); recTimerId = null; }
       document.getElementById('recInfo').style.display = 'none';
@@ -237,10 +238,13 @@
     }
 
     function handleReadyBlob(fixedBlob, elapsedMs) {
-      const url = URL.createObjectURL(fixedBlob);
-      result.src = url;
+      // Очистить оригинальные чанки, чтобы освободить память
+      for (let i = 0; i < chunks.length; i++) chunks[i] = null;
+      chunks.length = 0;
 
-      // Автоскачивание результата
+      const url = URL.createObjectURL(fixedBlob);
+
+      // Автоскачивание результата (без отображения в плеере)
       const a = document.createElement('a');
       const ts = new Date().toISOString().replace(/[:.]/g, '-');
       a.href = url;
@@ -248,6 +252,7 @@
       document.body.appendChild(a);
       a.click();
       a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
 
       console.log(`⏱️ rebuildWebM заняло ${elapsedMs.toFixed(1)} мс`);
       console.log('✅ Готово, файл скачан и доступен для просмотра');
