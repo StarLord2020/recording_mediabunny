@@ -55,6 +55,7 @@
     let recStartMs = 0;
     let worker = null;
     let fsWritable = null; // FileSystemWritableFileStream
+    const SAVE_STREAM_THRESHOLD = 500 * 1024 * 1024; // ~500 MB
 
     async function startRecording() {
       // Захват экрана + системного звука (если поддерживается браузером)
@@ -105,7 +106,10 @@
     }
 
     async function stopRecording() {
-      if (document.getElementById('saveToFile').checked && window.showSaveFilePicker && !fsWritable) {
+      // Автовыбор потоковой записи для больших файлов, если доступен FS API
+      const approxSize = (chunks || []).reduce((s, b) => s + (b?.size || 0), 0);
+      const wantStream = (document.getElementById('saveToFile').checked || approxSize > SAVE_STREAM_THRESHOLD);
+      if (wantStream && window.showSaveFilePicker && !fsWritable) {
         try {
           const handle = await window.showSaveFilePicker({
             suggestedName: `screen-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`,
@@ -229,9 +233,33 @@
           }
         });
       } catch (err) {
-        console.warn('Falling back to inline remux due to worker error:', err);
-        const fixedBlob = await rebuildWebM(chunks);
-        handleReadyBlob(fixedBlob, performance.now() - t0);
+        console.warn('Worker remux error:', err);
+        // Если упёрлись в память и есть FS API — попробуем потоковую запись
+        if (!streamToFile && window.showSaveFilePicker) {
+          try {
+            if (!fsWritable) {
+              const handle = await window.showSaveFilePicker({
+                suggestedName: `screen-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`,
+                types: [{ description: 'WebM Video', accept: { 'video/webm': ['.webm'] } }]
+              });
+              fsWritable = await handle.createWritable();
+            }
+            return await remuxInWorker(chunks, mimeType, t0, true);
+          } catch (e) {
+            console.warn('Stream-to-file fallback failed or canceled:', e);
+          }
+        }
+        // Фолбэк: inline ремакс (может занять много памяти)
+        try {
+          const fixedBlob = await rebuildWebM(chunks);
+          handleReadyBlob(fixedBlob, performance.now() - t0);
+        } catch (e2) {
+          console.error('Inline remux failed:', e2);
+          updateProgress(0);
+          progressEl.style.display = 'none';
+          progressTextEl.style.display = 'none';
+          alert('Не удалось обработать запись из-за нехватки памяти. Откройте в Chrome и включите потоковое сохранение.');
+        }
       } finally {
         if (worker) { worker.terminate(); worker = null; }
       }
