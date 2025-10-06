@@ -55,7 +55,6 @@
     let recStartMs = 0;
     let worker = null;
     let fsWritable = null; // FileSystemWritableFileStream
-    const SAVE_STREAM_THRESHOLD = 500 * 1024 * 1024; // ~500 MB
 
     async function startRecording() {
       // Захват экрана + системного звука (если поддерживается браузером)
@@ -106,9 +105,8 @@
     }
 
     async function stopRecording() {
-      // Автовыбор потоковой записи для больших файлов, если доступен FS API
-      const approxSize = (chunks || []).reduce((s, b) => s + (b?.size || 0), 0);
-      const wantStream = (document.getElementById('saveToFile').checked || approxSize > SAVE_STREAM_THRESHOLD);
+      // Всегда предпочитаем потоковую запись в файл, если доступен FS API
+      const wantStream = !!window.showSaveFilePicker;
       if (wantStream && window.showSaveFilePicker && !fsWritable) {
         try {
           const handle = await window.showSaveFilePicker({
