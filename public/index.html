@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <title>Mediabunny + Screen Recording Demo</title>
-  <script src="../dist/mediabunny.umd.js"></script>
+  <script src="./mediabunny.umd.js"></script>
   <style>
     video { width: 480px; margin: 10px; background: #000; }
     button { margin: 10px; padding: 8px 14px; }
@@ -150,7 +150,6 @@
       await conversion.execute();
 
       const buffer = target.buffer;
-      console.log(target, 'target target target');
       return new Blob([buffer], { type: 'video/webm' });
     }
 
