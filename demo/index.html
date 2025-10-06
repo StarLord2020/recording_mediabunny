@@ -76,13 +76,30 @@
 
         const t0 = performance.now();
 
-        // Предпочитаем Web Worker; если выбран режим прямой записи — стримим в файл
-        if (window.Worker) {
-          const streamToFile = !!(fsWritable && window.showSaveFilePicker);
-          await remuxInWorker(chunks, 'video/webm', t0, streamToFile);
+        // Если доступна запись в файл — делаем ремакс прямо в главном потоке (надёжнее)
+        if (fsWritable) {
+          try {
+            await remuxToFileMainThread(chunks, 'video/webm', t0, fsWritable);
+          } catch (e) {
+            console.warn('Stream-to-file (main thread) failed:', e);
+            try { await fsWritable.close(); } catch (_) {}
+            fsWritable = null;
+            // Фолбэк на воркер/память
+            if (window.Worker) await remuxInWorker(chunks, 'video/webm', t0, false);
+            else {
+              const fixedBlob = await rebuildWebM(chunks);
+              handleReadyBlob(fixedBlob, performance.now() - t0);
+            }
+          } finally {
+            fsWritable = null;
+          }
         } else {
-          const fixedBlob = await rebuildWebM(chunks);
-          handleReadyBlob(fixedBlob, performance.now() - t0);
+          // Нет потока в файл: используем воркер (в памяти) либо inline
+          if (window.Worker) await remuxInWorker(chunks, 'video/webm', t0, false);
+          else {
+            const fixedBlob = await rebuildWebM(chunks);
+            handleReadyBlob(fixedBlob, performance.now() - t0);
+          }
         }
       };
 
@@ -114,6 +131,7 @@
             types: [{ description: 'WebM Video', accept: { 'video/webm': ['.webm'] } }]
           });
           fsWritable = await handle.createWritable();
+          try { await fsWritable.truncate(0); } catch (_) {}
         } catch (e) {
           console.warn('Выбор файла отменён или ошибка FS API:', e);
         }
@@ -204,38 +222,7 @@
           };
           worker.onerror = (err) => reject(err);
 
-          if (streamToFile) {
-            if (!fsWritable) { reject(new Error('No writable handle')); return; }
-            const channel = new MessageChannel();
-            channel.port1.onmessage = async (msg) => {
-              const d = msg.data || {};
-              try {
-                if (d.type === 'write') {
-                  const u8 = new Uint8Array(d.data);
-                  if (typeof d.position === 'number') {
-                    await fsWritable.write({ type: 'write', position: d.position, data: u8 });
-                  } else {
-                    await fsWritable.write(u8);
-                  }
-                  channel.port1.postMessage({ type: 'ack', id: d.id });
-                } else if (d.type === 'close') {
-                  await fsWritable.close();
-                  fsWritable = null;
-                  channel.port1.postMessage({ type: 'ack', id: d.id });
-                } else if (d.type === 'abort') {
-                  try { await fsWritable.abort?.(); } catch (_) {}
-                  try { await fsWritable.close(); } catch (_) {}
-                  fsWritable = null;
-                  channel.port1.postMessage({ type: 'ack', id: d.id });
-                }
-              } catch (err) {
-                channel.port1.postMessage({ type: 'nack', id: d.id, message: String(err) });
-              }
-            };
-            worker.postMessage({ mode: 'stream', chunks, mimeType, port: channel.port2 }, [channel.port2]);
-          } else {
-            worker.postMessage({ mode: 'buffer', chunks, mimeType });
-          }
+          worker.postMessage({ mode: 'buffer', chunks, mimeType });
         });
       } catch (err) {
         console.warn('Worker remux error:', err);
@@ -268,6 +255,35 @@
       } finally {
         if (worker) { worker.terminate(); worker = null; }
       }
+    }
+
+    async function remuxToFileMainThread(chunks, mimeType, t0, writable) {
+      const { Input, Output, WebMOutputFormat, StreamTarget, BlobSource, WEBM, Conversion } = window.Mediabunny;
+      // Очистим файл и пишем последовательно
+      try { await writable.truncate?.(0); } catch (_) {}
+
+      const fullBlob = new Blob(chunks, { type: mimeType });
+      const input = new Input({ source: new BlobSource(fullBlob), formats: [WEBM] });
+      const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
+      const output = new Output({ format: new WebMOutputFormat(), target });
+
+      const conversion = await Conversion.init({ input, output });
+      conversion.onProgress = (p) => {
+        const percent = Math.max(0, Math.min(1, p));
+        updateProgress(percent);
+        console.log(`📈 Mediabunny progress (file): ${(percent * 100).toFixed(1)}%`);
+      };
+      await conversion.execute();
+      try { await writable.close(); } catch (_) {}
+
+      // Очистить чанки, скачивание не нужно (файл уже сохранён)
+      for (let i = 0; i < chunks.length; i++) chunks[i] = null;
+      chunks.length = 0;
+
+      const elapsed = performance.now() - t0;
+      console.log(`⏱️ rebuildWebM (file) заняло ${elapsed.toFixed(1)} мс`);
+      updateProgress(1);
+      setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600);
     }
 
     function handleReadyBlob(fixedBlob, elapsedMs) {
