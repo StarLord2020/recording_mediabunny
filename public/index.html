@@ -51,7 +51,7 @@
     const progressBarEl = document.getElementById('progressBar');
     const progressTextEl = document.getElementById('progressText');
 
-    let recorder, chunks = [];
+    let recorder;
     let recTimerId = null;
     let recStartMs = 0;
     let worker = null;
@@ -69,17 +69,18 @@
       try {
         idbWriter = new IDBWriter();
         idbRequestPersistence?.();
-        await idbWriter.start({ filenameBase: 'screen-recording', mimeType: 'video/webm', roomId: undefined });
+        currentSessionId = await idbWriter.start({ filenameBase: 'screen-recording', mimeType: 'video/webm', roomId: undefined });
       } catch (e) {
         console.warn('IDB session init failed:', e);
         idbWriter = null;
+        currentSessionId = null;
       }
-      chunks = [];
 
       recorder.ondataavailable = e => {
-        if (e.data.size > 0) chunks.push(e.data);
-        // Пишем чанк в IndexedDB, если доступно
-        try { idbWriter?.enqueue(e.data); } catch (_) {}
+        // Пишем чанк сразу в IndexedDB, локальный массив не используем
+        if (e.data && e.data.size > 0) {
+          try { idbWriter?.enqueue(e.data); } catch (_) {}
+        }
       };
 
       recorder.onstop = async () => {
@@ -90,30 +91,26 @@
 
         const t0 = performance.now();
 
-        // Если доступна запись в файл — делаем ремакс прямо в главном потоке (надёжнее)
-        if (fsWritable) {
+        // Если доступна запись в файл — делаем ремакс из IndexedDB прямо в файл (надёжнее)
+        if (fsWritable && currentSessionId) {
           try {
-            await remuxToFileMainThread(chunks, 'video/webm', t0, fsWritable);
+            await remuxToFileFromIDB(currentSessionId, 'video/webm', t0, fsWritable);
           } catch (e) {
             console.warn('Stream-to-file (main thread) failed:', e);
             try { await fsWritable.close(); } catch (_) {}
             fsWritable = null;
-            // Фолбэк на воркер/память
-            if (window.Worker) await remuxInWorker(chunks, 'video/webm', t0, false);
-            else {
-              const fixedBlob = await rebuildWebM(chunks);
-              handleReadyBlob(fixedBlob, performance.now() - t0);
-            }
+            // Фолбэк: собираем Blob из IndexedDB и ремаксим в памяти
+            const fullBlob = await buildBlobFromIDB(currentSessionId);
+            const fixedBlob = await rebuildBlobWebM(fullBlob);
+            handleReadyBlob(fixedBlob, performance.now() - t0);
           } finally {
             fsWritable = null;
           }
         } else {
-          // Нет потока в файл: используем воркер (в памяти) либо inline
-          if (window.Worker) await remuxInWorker(chunks, 'video/webm', t0, false);
-          else {
-            const fixedBlob = await rebuildWebM(chunks);
-            handleReadyBlob(fixedBlob, performance.now() - t0);
-          }
+          // Нет потока в файл: собираем Blob из IndexedDB и ремаксим в памяти
+          const fullBlob = await buildBlobFromIDB(currentSessionId);
+          const fixedBlob = await rebuildBlobWebM(fullBlob);
+          handleReadyBlob(fixedBlob, performance.now() - t0);
         }
       };
 
@@ -205,110 +202,84 @@
       document.getElementById('recTime').textContent = `${m}:${s}`;
     }
 
-    async function remuxInWorker(chunks, mimeType, t0, streamToFile) {
+    async function remuxInWorker() {
       try {
-        if (worker) { worker.terminate(); worker = null; }
-        // Bust worker cache to ensure latest code
-        worker = new Worker(`remux.worker.js?v=${Date.now()}`);
-        await new Promise((resolve, reject) => {
-          worker.onmessage = async (ev) => {
-            const { type } = ev.data || {};
-            if (type === 'progress') {
-              const p = Math.max(0, Math.min(1, ev.data.progress || 0));
-              updateProgress(p);
-              console.log(`📈 Mediabunny progress (worker): ${(p * 100).toFixed(1)}%`);
-            } else if (type === 'done') {
-              const elapsed = typeof ev.data.elapsedMs === 'number' ? ev.data.elapsedMs : (performance.now() - t0);
-              if (ev.data.streamed) {
-                try { if (fsWritable) await fsWritable.close(); } catch (e) {}
-                fsWritable = null;
-                console.log(`⏱️ rebuildWebM заняло ${elapsed.toFixed(1)} мс`);
-                console.log('✅ Готово, файл сохранён');
-                updateProgress(1);
-                setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600);
-                resolve();
-              } else {
-                const buffer = ev.data.buffer; // ArrayBuffer (transferable)
-                const blob = new Blob([buffer], { type: 'video/webm' });
-                handleReadyBlob(blob, elapsed);
-                resolve();
-              }
-            } else if (type === 'error') {
-              console.error('Remux worker error:', ev.data.message);
-              reject(new Error(ev.data.message));
-            }
-          };
-          worker.onerror = (err) => reject(err);
-
-          worker.postMessage({ mode: 'buffer', chunks, mimeType });
-        });
+        // worker path is disabled when using IDB-only flow
+        console.warn('Worker remux path disabled in IDB-only mode');
       } catch (err) {
         console.warn('Worker remux error:', err);
-        // Если упёрлись в память и есть FS API — попробуем потоковую запись
-        if (!streamToFile && window.showSaveFilePicker) {
-          try {
-            if (!fsWritable) {
-              const handle = await window.showSaveFilePicker({
-                suggestedName: `screen-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`,
-                types: [{ description: 'WebM Video', accept: { 'video/webm': ['.webm'] } }]
-              });
-              fsWritable = await handle.createWritable();
-            }
-            return await remuxInWorker(chunks, mimeType, t0, true);
-          } catch (e) {
-            console.warn('Stream-to-file fallback failed or canceled:', e);
-          }
-        }
-        // Фолбэк: inline ремакс (может занять много памяти)
-        try {
-          const fixedBlob = await rebuildWebM(chunks);
-          handleReadyBlob(fixedBlob, performance.now() - t0);
-        } catch (e2) {
-          console.error('Inline remux failed:', e2);
-          updateProgress(0);
-          progressEl.style.display = 'none';
-          progressTextEl.style.display = 'none';
-          alert('Не удалось обработать запись из-за нехватки памяти. Откройте в Chrome и включите потоковое сохранение.');
-        }
+        // fallback handled in onstop branch via IDB blob path
       } finally {
         if (worker) { worker.terminate(); worker = null; }
       }
     }
 
-    async function remuxToFileMainThread(chunks, mimeType, t0, writable) {
-      const { Input, Output, WebMOutputFormat, StreamTarget, BlobSource, WEBM, Conversion } = window.Mediabunny;
-      // Очистим файл и пишем последовательно
+    async function remuxToFileFromIDB(sessionId, mimeType, t0, writable) {
+      const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny;
       try { await writable.truncate?.(0); } catch (_) {}
-
-      const fullBlob = new Blob(chunks, { type: mimeType });
-      const input = new Input({ source: new BlobSource(fullBlob), formats: [WEBM] });
+      const db = await idbOpenDB();
+      const sess = await new Promise((res, rej) => {
+        const tx = db.transaction('sessions','readonly');
+        const r = tx.objectStore('sessions').get(sessionId);
+        r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+      });
+      if (!sess) throw new Error('Session not found');
+      const rows = await new Promise((res, rej) => {
+        const tx = db.transaction('chunks','readonly');
+        const idx = tx.objectStore('chunks').index('bySession');
+        const req = idx.getAll(IDBKeyRange.only(sessionId));
+        req.onsuccess = () => res(req.result.sort((a,b)=>a.seq-b.seq));
+        req.onerror = () => rej(req.error);
+      });
+      const stream = new ReadableStream({
+        async start(controller) {
+          try {
+            for (const row of rows) {
+              const blob = row.blob || new Blob([row.ab], { type: mimeType });
+              const ab = await blob.arrayBuffer();
+              controller.enqueue(new Uint8Array(ab));
+            }
+            controller.close();
+          } catch (e) { controller.error(e); }
+        }
+      });
+      const input = new Input({ source: new ReadableStreamSource(stream), formats: [WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
-
       const conversion = await Conversion.init({ input, output });
       conversion.onProgress = (p) => {
         const percent = Math.max(0, Math.min(1, p));
         updateProgress(percent);
-        console.log(`📈 Mediabunny progress (file): ${(percent * 100).toFixed(1)}%`);
+        console.log(`📈 Mediabunny progress (file from IDB): ${(percent * 100).toFixed(1)}%`);
       };
       await conversion.execute();
       try { await writable.close(); } catch (_) {}
-
-      // Очистить чанки, скачивание не нужно (файл уже сохранён)
-      for (let i = 0; i < chunks.length; i++) chunks[i] = null;
-      chunks.length = 0;
-
       const elapsed = performance.now() - t0;
-      console.log(`⏱️ rebuildWebM (file) заняло ${elapsed.toFixed(1)} мс`);
+      console.log(`⏱️ rebuildWebM (file from IDB) заняло ${elapsed.toFixed(1)} мс`);
       updateProgress(1);
       setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600);
     }
 
-    function handleReadyBlob(fixedBlob, elapsedMs) {
-      // Очистить оригинальные чанки, чтобы освободить память
-      for (let i = 0; i < chunks.length; i++) chunks[i] = null;
-      chunks.length = 0;
+    async function buildBlobFromIDB(sessionId) {
+      const db = await idbOpenDB();
+      const sess = await new Promise((res, rej) => {
+        const tx = db.transaction('sessions','readonly');
+        const r = tx.objectStore('sessions').get(sessionId);
+        r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+      });
+      if (!sess) throw new Error('Session not found');
+      const rows = await new Promise((res, rej) => {
+        const tx = db.transaction('chunks','readonly');
+        const idx = tx.objectStore('chunks').index('bySession');
+        const req = idx.getAll(IDBKeyRange.only(sessionId));
+        req.onsuccess = () => res(req.result.sort((a,b)=>a.seq-b.seq));
+        req.onerror = () => rej(req.error);
+      });
+      const parts = rows.map((r) => r.blob || new Blob([r.ab], { type: 'video/webm' }));
+      return new Blob(parts, { type: 'video/webm' });
+    }
 
+    function handleReadyBlob(fixedBlob, elapsedMs) {
       const url = URL.createObjectURL(fixedBlob);
 
       // Автоскачивание результата (без отображения в плеере)
