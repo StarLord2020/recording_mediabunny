@@ -87,7 +87,7 @@ class IDBWriter {
     });
   }
 
-  async cleanupOldSessions(db, keepCount = 10) {
+  async cleanupOldSessions(db, keepCount = Infinity) {
     return new Promise((resolve, reject) => {
       const tx = db.transaction([SESS, CHUNKS], 'readwrite');
       const sessStore = tx.objectStore(SESS);
@@ -95,7 +95,7 @@ class IDBWriter {
 
       getAllReq.onsuccess = () => {
         let sessions = getAllReq.result;
-        if (sessions.length > keepCount) {
+        if (Number.isFinite(keepCount) && sessions.length > keepCount) {
           sessions.sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));
           const toDelete = sessions.slice(0, sessions.length - keepCount);
           toDelete.forEach(sess => {
@@ -211,4 +211,3 @@ window.idbDeleteSession = deleteSession;
 window.idbRequestPersistence = requestPersistence;
 window.idbGetSessionsByRoom = getSessionsByRoom;
 window.idbGetStorageUsageInfo = getStorageUsageInfo;
-

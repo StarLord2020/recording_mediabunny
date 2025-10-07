@@ -215,19 +215,7 @@
       const writable = await handle.createWritable({ keepExistingData: false });
       try { await writable.truncate(0); } catch(_) {}
 
-      let bytesWritten = 0;
-      const counting = {
-        async write(data) {
-          let len = 0;
-          if (data instanceof Uint8Array) len = data.byteLength;
-          else if (data && typeof data === 'object') len = data.size ?? data.byteLength ?? data.length ?? 0;
-          await writable.write(data);
-          bytesWritten += (len|0);
-        },
-        async seek(p) { await writable.seek(p); },
-        async truncate(n) { await writable.truncate(n); bytesWritten = Math.min(bytesWritten, n|0); },
-        async close() { /* postpone close until padding done */ }
-      };
+      // Пишем напрямую в FileSystemWritableFileStream
       // Построим индекс и виртуальный источник с произвольным доступом
       const { db, count, sizes, prefix, totalSize } = await buildSessionIndex(sessionId, mimeType);
       const source = new StreamSource({
@@ -252,23 +240,18 @@
         prefetchProfile: 'fileSystem'
       });
       const input = new Input({ source, formats: [WEBM] });
-      const target = new StreamTarget(counting, { chunked: true, chunkSize: 16 * 1024 * 1024 });
+      const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output, audio: { forceTranscode: true } });
       conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
       await conversion.execute();
 
       const padChunk = new Uint8Array(16 * 1024 * 1024);
-      while (bytesWritten < targetBytes) {
-        const remain = targetBytes - bytesWritten;
-        if (remain <= 0) break;
-        if (remain < padChunk.length) {
-          await writable.write(padChunk.subarray(0, remain));
-          bytesWritten += remain;
-          break;
-        }
-        await writable.write(padChunk);
-        bytesWritten += padChunk.length;
+      let remaining = targetBytes;
+      while (remaining > 0) {
+        const slice = remaining < padChunk.length ? padChunk.subarray(0, remaining) : padChunk;
+        await writable.write(slice);
+        remaining -= slice.length;
       }
       await writable.close();
     }
