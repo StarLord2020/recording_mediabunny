@@ -49,6 +49,13 @@
   </div>
   <div class="progress__text" id="progressText" style="display:none">0%</div>
 
+  <div style="margin:10px 0;">
+    <button id="procLastBtn">💾 Собрать последнюю сессию в файл</button>
+    <button id="procSelectedBtn">📂 Собрать выбранную сессию</button>
+    <select id="sessionSelect" style="min-width:320px;"></select>
+    <button id="refreshSessionsBtn">🔄</button>
+  </div>
+
   <script>
     // Простая обёртка над текущей логикой из index.html — используем те же helper'ы
     const preview = document.getElementById('preview');
@@ -57,6 +64,10 @@
     const progressEl = document.getElementById('progress');
     const progressBarEl = document.getElementById('progressBar');
     const progressTextEl = document.getElementById('progressText');
+    const procLastBtn = document.getElementById('procLastBtn');
+    const procSelectedBtn = document.getElementById('procSelectedBtn');
+    const sessionSelect = document.getElementById('sessionSelect');
+    const refreshSessionsBtn = document.getElementById('refreshSessionsBtn');
 
     let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let fsHandle = null; let idbWriter = null; let currentSessionId = null;
     let firstChunkBlob = null; // для генерации большого входа
@@ -132,6 +143,24 @@
       document.getElementById('recInfo').style.display = 'none';
       try { await idbWriter?.stop(); } catch(_) {}
       idbWriter = null;
+    }
+
+    async function loadSessionsIntoSelect() {
+      try {
+        sessionSelect.innerHTML = '';
+        const sessions = await idbListSessions();
+        sessions.sort((a,b)=> (b.startedAt||0) - (a.startedAt||0));
+        for (const s of sessions) {
+          const started = s.startedAt ? new Date(s.startedAt).toLocaleString() : 'нет даты';
+          const opt = document.createElement('option');
+          opt.value = s.id;
+          opt.textContent = `${started} — ${s.chunkCount||0} чанков`;
+          opt.dataset.mime = s.mimeType || 'video/webm';
+          sessionSelect.appendChild(opt);
+        }
+      } catch (e) {
+        console.warn('loadSessions failed', e);
+      }
     }
     function handleReadyBlob(fixedBlob, elapsedMs) {
       const url = URL.createObjectURL(fixedBlob);
@@ -361,6 +390,35 @@
     }
 
     startBtn.onclick = startRecording; stopBtn.onclick = stopRecording;
+    procLastBtn.onclick = async () => {
+      try {
+        const debugMB = Number(document.getElementById('debugMB').value||0);
+        if (!debugMB || debugMB<=0) { alert('Укажите размер (МБ) > 0'); return; }
+        const sessions = await idbListSessions();
+        if (!sessions || !sessions.length) { alert('В IndexedDB нет сессий'); return; }
+        sessions.sort((a,b)=> (b.startedAt||0) - (a.startedAt||0));
+        const s = sessions[0];
+        if (!window.showSaveFilePicker) { alert('Нужен File System Access API'); return; }
+        fsHandle = await window.showSaveFilePicker({ suggestedName: `debug-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types:[{description:'WebM', accept: {'video/webm':['.webm']}}]});
+        await remuxOnceToFileAndPad(s.id, s.mimeType || 'video/webm', fsHandle, debugMB);
+        alert('Готово: файл записан');
+      } catch (e) { console.warn('procLast failed', e); alert('Не удалось собрать последнюю сессию'); }
+    };
+    procSelectedBtn.onclick = async () => {
+      try {
+        const debugMB = Number(document.getElementById('debugMB').value||0);
+        if (!debugMB || debugMB<=0) { alert('Укажите размер (МБ) > 0'); return; }
+        const sel = sessionSelect.value;
+        if (!sel) { alert('Выберите сессию'); return; }
+        const mime = sessionSelect.options[sessionSelect.selectedIndex]?.dataset?.mime || 'video/webm';
+        if (!window.showSaveFilePicker) { alert('Нужен File System Access API'); return; }
+        fsHandle = await window.showSaveFilePicker({ suggestedName: `debug-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types:[{description:'WebM', accept: {'video/webm':['.webm']}}]});
+        await remuxOnceToFileAndPad(sel, mime, fsHandle, debugMB);
+        alert('Готово: файл записан');
+      } catch (e) { console.warn('procSelected failed', e); alert('Не удалось собрать выбранную сессию'); }
+    };
+    refreshSessionsBtn.onclick = loadSessionsIntoSelect;
+    loadSessionsIntoSelect();
   </script>
 </body>
 </html>
