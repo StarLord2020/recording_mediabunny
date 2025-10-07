@@ -183,38 +183,74 @@
       try { await writable.close(); } catch(_) {}
     }
 
-    // ==== Отладка: генерация большого входного файла путём повторения всей сессии из IDB ====
+    // ==== Отладка: генерация большого входного файла на базе виртуального источника StreamSource ====
+    async function buildSessionIndex(sessionId, mimeType) {
+      const db = await idbOpenDB();
+      const sess = await new Promise((res, rej) => { const tx = db.transaction('sessions','readonly'); const r = tx.objectStore('sessions').get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      const count = sess?.chunkCount ?? null;
+      if (!count || count <= 0) throw new Error('Session has no chunks');
+      const sizes = new Array(count);
+      let total = 0;
+      for (let i = 0; i < count; i++) {
+        const tx = db.transaction('chunks','readonly');
+        const store = tx.objectStore('chunks');
+        const row = await new Promise((res, rej) => { const g = store.get([sessionId, i]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+        if (!row) { sizes[i] = 0; continue; }
+        const size = row.blob ? row.blob.size : (row.ab ? row.ab.byteLength : 0);
+        sizes[i] = size;
+        total += size;
+      }
+      if (total === 0) throw new Error('All chunks are empty');
+      const prefix = new Array(count);
+      let acc = 0; for (let i = 0; i < count; i++) { prefix[i] = acc; acc += sizes[i]; }
+      return { db, count, sizes, prefix, totalSize: total };
+    }
+
+    function locateChunkByOffset(prefix, sizes, offset) {
+      // binary search over prefix sums to find largest index with prefix[i] <= offset
+      let lo = 0, hi = sizes.length - 1, ans = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (prefix[mid] <= offset) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+      }
+      const seq = ans;
+      const chunkOffset = offset - prefix[seq];
+      return { seq, chunkOffset };
+    }
+
     async function remuxDebugFromIDBToFile(sessionId, sizeMB, mimeType, writable) {
-      const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny;
+      const { Input, Output, WebMOutputFormat, StreamTarget, StreamSource, WEBM, Conversion } = window.Mediabunny;
       const targetBytes = Math.max(0, Math.floor(sizeMB * 1024 * 1024));
       if (targetBytes === 0) throw new Error('Target size must be > 0');
-      const db = await idbOpenDB();
-      let produced = 0;
-      let nextSeq = 0;
-      const stream = new ReadableStream({
-        async pull(controller) {
-          if (produced >= targetBytes) { controller.close(); return; }
-          // Попытка получить точный seq; если нет — начинаем новый цикл с 0
-          const tx = db.transaction('chunks','readonly');
-          const store = tx.objectStore('chunks');
-          let row = await new Promise((res, rej) => { const g = store.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
-          if (!row) {
-            nextSeq = 0;
-            const tx2 = db.transaction('chunks','readonly');
-            const store2 = tx2.objectStore('chunks');
-            row = await new Promise((res, rej) => { const g = store2.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
-            if (!row) { controller.close(); return; }
+      const index = await buildSessionIndex(sessionId, mimeType);
+      const source = new StreamSource({
+        getSize: () => targetBytes,
+        read: async (start, end) => {
+          const len = end - start;
+          const out = new Uint8Array(len);
+          let written = 0;
+          let pos = start;
+          while (written < len) {
+            const loopOffset = pos % index.totalSize;
+            const { seq, chunkOffset } = locateChunkByOffset(index.prefix, index.sizes, loopOffset);
+            const tx = index.db.transaction('chunks','readonly');
+            const store = tx.objectStore('chunks');
+            const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (!row) throw new Error('Missing chunk during debug read');
+            const blob = row.blob || new Blob([row.ab], { type: mimeType });
+            const maxFromChunk = Math.min(blob.size - chunkOffset, len - written);
+            const slice = blob.slice(chunkOffset, chunkOffset + maxFromChunk);
+            const ab = await slice.arrayBuffer();
+            out.set(new Uint8Array(ab), written);
+            written += ab.byteLength;
+            pos += ab.byteLength;
           }
-          const blob = row.blob || new Blob([row.ab], { type: mimeType });
-          const remaining = targetBytes - produced;
-          const slice = remaining < blob.size ? blob.slice(0, remaining) : blob;
-          const ab = await slice.arrayBuffer();
-          controller.enqueue(new Uint8Array(ab));
-          produced += ab.byteLength;
-          nextSeq = (row.seq || nextSeq) + 1;
-        }
+          return out;
+        },
+        maxCacheSize: 128 * 1024 * 1024,
+        prefetchProfile: 'fileSystem'
       });
-      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
+      const input = new Input({ source, formats: [WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output });
@@ -224,34 +260,38 @@
     }
 
     async function remuxDebugFromIDBToBlob(sessionId, sizeMB, mimeType) {
-      const { Input, Output, WebMOutputFormat, BufferTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny;
+      const { Input, Output, WebMOutputFormat, BufferTarget, StreamSource, WEBM, Conversion } = window.Mediabunny;
       const targetBytes = Math.max(0, Math.floor(sizeMB * 1024 * 1024));
       if (targetBytes === 0) throw new Error('Target size must be > 0');
-      const db = await idbOpenDB();
-      let produced = 0; let nextSeq = 0;
-      const stream = new ReadableStream({
-        async pull(controller) {
-          if (produced >= targetBytes) { controller.close(); return; }
-          const tx = db.transaction('chunks','readonly');
-          const store = tx.objectStore('chunks');
-          let row = await new Promise((res, rej) => { const g = store.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
-          if (!row) {
-            nextSeq = 0;
-            const tx2 = db.transaction('chunks','readonly');
-            const store2 = tx2.objectStore('chunks');
-            row = await new Promise((res, rej) => { const g = store2.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
-            if (!row) { controller.close(); return; }
+      const index = await buildSessionIndex(sessionId, mimeType);
+      const source = new StreamSource({
+        getSize: () => targetBytes,
+        read: async (start, end) => {
+          const len = end - start;
+          const out = new Uint8Array(len);
+          let written = 0;
+          let pos = start;
+          while (written < len) {
+            const loopOffset = pos % index.totalSize;
+            const { seq, chunkOffset } = locateChunkByOffset(index.prefix, index.sizes, loopOffset);
+            const tx = index.db.transaction('chunks','readonly');
+            const store = tx.objectStore('chunks');
+            const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (!row) throw new Error('Missing chunk during debug read');
+            const blob = row.blob || new Blob([row.ab], { type: mimeType });
+            const maxFromChunk = Math.min(blob.size - chunkOffset, len - written);
+            const slice = blob.slice(chunkOffset, chunkOffset + maxFromChunk);
+            const ab = await slice.arrayBuffer();
+            out.set(new Uint8Array(ab), written);
+            written += ab.byteLength;
+            pos += ab.byteLength;
           }
-          const blob = row.blob || new Blob([row.ab], { type: mimeType });
-          const remaining = targetBytes - produced;
-          const slice = remaining < blob.size ? blob.slice(0, remaining) : blob;
-          const ab = await slice.arrayBuffer();
-          controller.enqueue(new Uint8Array(ab));
-          produced += ab.byteLength;
-          nextSeq = (row.seq || nextSeq) + 1;
-        }
+          return out;
+        },
+        maxCacheSize: 128 * 1024 * 1024,
+        prefetchProfile: 'fileSystem'
       });
-      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
+      const input = new Input({ source, formats: [WEBM] });
       const target = new BufferTarget();
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output });
