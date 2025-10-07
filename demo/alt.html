@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <title>Mediabunny Demo — Альтернативная</title>
+  <title>Mediabunny Demo — Отладка</title>
   <script src="../dist/mediabunny.umd.js"></script>
   <script src="./idb-recorder.js"></script>
   <style>
@@ -19,7 +19,7 @@
 <body>
   <div class="nav">
     <a href="./index.html">Главная</a>
-    <a href="./alt.html"><strong>Альтернативная</strong></a>
+    <a href="./alt.html"><strong>Отладка</strong></a>
   </div>
 
   <h2>🎬 Альтернативная страница: запись и ремакс WebM</h2>
@@ -27,7 +27,7 @@
   <div style="margin:10px 0; padding:8px; background:#f5f5f5; border-radius:6px;">
     <strong>Отладка больших файлов</strong><br>
     <label>
-      <input type="checkbox" id="debugEnable"> Включить генерацию большого входного файла (повторяем первый чанк)
+      <input type="checkbox" id="debugEnable" checked disabled> Генерация большого входного файла включена
     </label>
     <div style="margin-top:6px;">
       Размер, МБ: <input id="debugMB" type="number" min="0" step="100" value="0" style="width:100px;"> 
@@ -77,6 +77,19 @@
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       preview.srcObject = stream;
       recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs=vp9,opus' });
+      // Для отладки больших размеров заранее попросим файл, чтобы не было фолбэка
+      try {
+        if (window.showSaveFilePicker && !fsHandle) {
+          fsHandle = await window.showSaveFilePicker({
+            suggestedName: `debug-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`,
+            types: [{ description: 'WebM Video', accept: { 'video/webm': ['.webm'] } }]
+          });
+          fsWritable = await fsHandle.createWritable({ keepExistingData: false });
+          try { await fsWritable.truncate(0); } catch(_) {}
+        }
+      } catch(e) {
+        // Пользователь мог отменить диалог — тихо продолжаем, фолбэк сработает позже
+      }
       try { idbWriter = new IDBWriter(); idbRequestPersistence?.(); currentSessionId = await idbWriter.start({ filenameBase: 'screen-recording', mimeType: 'video/webm', roomId: undefined }); } catch (_) { idbWriter = null; currentSessionId = null; }
       recorder.ondataavailable = e => {
         if (e.data && e.data.size > 0) {
@@ -94,11 +107,10 @@
             if (fsWritable && fsHandle) {
               await remuxOnceToFileAndPad(currentSessionId, 'video/webm', fsHandle, debugMB);
             } else {
-              console.warn('Debug big-size requires FS API; falling back to normal remux');
               await fallbackFromIDB();
             }
           } catch (e) {
-            console.warn('Debug remux failed, fallback to IDB path:', e);
+            // Тихий фолбэк без лишнего шума в консоли
             if (fsWritable) { try { await fsWritable.close(); } catch (_) {} }
             await fallbackFromIDB();
           }
