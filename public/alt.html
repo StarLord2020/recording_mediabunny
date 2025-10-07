@@ -269,7 +269,30 @@
         prefetchProfile: 'fileSystem'
       });
       const input = new Input({ source, formats: [WEBM] });
-      const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
+      // Оборачиваем FileSystemWritableFileStream во WritableStream для StreamTarget
+      const sink = new WritableStream({
+        async write(chunk) {
+          const data = chunk && chunk.data !== undefined ? chunk.data : chunk;
+          const position = chunk && typeof chunk.position === 'number' ? chunk.position : undefined;
+          let u8;
+          if (data instanceof Uint8Array) u8 = data;
+          else if (data?.buffer) u8 = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length || 0);
+          else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+          else {
+            const ab = await new Blob([data]).arrayBuffer();
+            u8 = new Uint8Array(ab);
+          }
+          if (typeof position === 'number') {
+            try { await writable.seek(position); } catch (_) {}
+          }
+          await writable.write(u8);
+        },
+        async close() {
+          // Закрываем после паддинга вручную
+        },
+        async abort() {}
+      }, { highWaterMark: 1 });
+      const target = new StreamTarget(sink, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output, audio: { forceTranscode: true } });
       conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
