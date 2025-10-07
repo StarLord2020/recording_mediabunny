@@ -21,6 +21,7 @@
     <a href="./index.html">Главная</a>
     <a href="./alt.html"><strong>Альтернативная</strong></a>
   </div>
+
   <h2>🎬 Альтернативная страница: запись и ремакс WebM</h2>
 
   <div style="margin:10px 0; padding:8px; background:#f5f5f5; border-radius:6px;">
@@ -49,6 +50,7 @@
   <div class="progress__text" id="progressText" style="display:none">0%</div>
 
   <script>
+    // Простая обёртка над текущей логикой из index.html — используем те же helper'ы
     const preview = document.getElementById('preview');
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
@@ -56,23 +58,50 @@
     const progressBarEl = document.getElementById('progressBar');
     const progressTextEl = document.getElementById('progressText');
 
-    let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let idbWriter = null; let currentSessionId = null; let firstChunkBlob = null;
-    function updateProgress(p) { const clamped = Math.max(0, Math.min(1, p || 0)); progressBarEl.style.width = `${(clamped*100).toFixed(1)}%`; progressTextEl.textContent = `${(clamped*100).toFixed(1)}%`; }
-    function updateRecTime(ms) { const totalSec = Math.max(0, Math.floor(ms / 1000)); const m = Math.floor(totalSec / 60).toString(); const s = (totalSec % 60).toString().padStart(2,'0'); document.getElementById('recTime').textContent = `${m}:${s}`; }
+    let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let fsHandle = null; let idbWriter = null; let currentSessionId = null;
+    let firstChunkBlob = null; // для генерации большого входа
+
+    function updateProgress(p) {
+      const clamped = Math.max(0, Math.min(1, p || 0));
+      progressBarEl.style.width = `${(clamped*100).toFixed(1)}%`;
+      progressTextEl.textContent = `${(clamped*100).toFixed(1)}%`;
+    }
+    function updateRecTime(ms) {
+      const totalSec = Math.max(0, Math.floor(ms / 1000));
+      const m = Math.floor(totalSec / 60).toString();
+      const s = (totalSec % 60).toString().padStart(2,'0');
+      document.getElementById('recTime').textContent = `${m}:${s}`;
+    }
 
     async function startRecording() {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       preview.srcObject = stream;
       recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs=vp9,opus' });
       try { idbWriter = new IDBWriter(); idbRequestPersistence?.(); currentSessionId = await idbWriter.start({ filenameBase: 'screen-recording', mimeType: 'video/webm', roomId: undefined }); } catch (_) { idbWriter = null; currentSessionId = null; }
-      recorder.ondataavailable = e => { if (e.data && e.data.size > 0) { if (!firstChunkBlob) firstChunkBlob = e.data; try { idbWriter?.enqueue(e.data); } catch (_) {} } };
+      recorder.ondataavailable = e => {
+        if (e.data && e.data.size > 0) {
+          if (!firstChunkBlob) firstChunkBlob = e.data;
+          try { idbWriter?.enqueue(e.data); } catch (_) {}
+        }
+      };
       recorder.onstop = async () => {
         progressEl.style.display = ''; progressTextEl.style.display = ''; updateProgress(0);
         const t0 = performance.now();
-        const debugEnabled = document.getElementById('debugEnable').checked; const debugMB = Number(document.getElementById('debugMB').value || 0);
+        const debugEnabled = document.getElementById('debugEnable').checked;
+        const debugMB = Number(document.getElementById('debugMB').value || 0);
         if (debugEnabled && debugMB > 0) {
-          try { if (fsWritable) { await remuxDebugFromIDBToFile(currentSessionId, debugMB, 'video/webm', fsWritable); } else { const blob = await remuxDebugFromIDBToBlob(currentSessionId, debugMB, 'video/webm'); handleReadyBlob(blob, performance.now() - t0); } }
-          catch (e) { console.warn('Debug remux failed, fallback to IDB path:', e); if (fsWritable) { try { await fsWritable.close(); } catch (_) {} } await fallbackFromIDB(); }
+          try {
+            if (fsWritable && fsHandle) {
+              await remuxOnceToFileAndPad(currentSessionId, 'video/webm', fsHandle, debugMB);
+            } else {
+              console.warn('Debug big-size requires FS API; falling back to normal remux');
+              await fallbackFromIDB();
+            }
+          } catch (e) {
+            console.warn('Debug remux failed, fallback to IDB path:', e);
+            if (fsWritable) { try { await fsWritable.close(); } catch (_) {} }
+            await fallbackFromIDB();
+          }
         } else if (fsWritable && currentSessionId) {
           try { await remuxToFileFromIDB(currentSessionId, 'video/webm', t0, fsWritable); }
           catch (e) {
@@ -103,15 +132,247 @@
       try { await idbWriter?.stop(); } catch(_) {}
       idbWriter = null;
     }
-    function handleReadyBlob(fixedBlob, elapsedMs) { const url = URL.createObjectURL(fixedBlob); const a = Object.assign(document.createElement('a'), { href: url, download: `screen-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm` }); document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); updateProgress(1); setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600); }
-    async function fallbackFromIDB() { const fullBlob = await buildBlobFromIDB(currentSessionId); const fixedBlob = await rebuildBlobWebM(fullBlob); handleReadyBlob(fixedBlob, 0); }
-    async function buildBlobFromIDB(sessionId) { const db = await idbOpenDB(); const rows = await new Promise((res, rej) => { const tx = db.transaction('chunks','readonly'); const idx = tx.objectStore('chunks').index('bySession'); const req = idx.getAll(IDBKeyRange.only(sessionId)); req.onsuccess = () => res(req.result.sort((a,b)=>a.seq-b.seq)); req.onerror = () => rej(req.error); }); const parts = rows.map((r) => r.blob || new Blob([r.ab], { type: 'video/webm' })); return new Blob(parts, { type: 'video/webm' }); }
-    async function remuxToFileFromIDB(sessionId, mimeType, t0, writable) { const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny; try { await writable.truncate?.(0); } catch(_) {} const db = await idbOpenDB(); const sess = await new Promise((res, rej) => { const tx = db.transaction('sessions','readonly'); const r = tx.objectStore('sessions').get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const expectedCount = sess?.chunkCount ?? null; let nextSeq = 0; let reachedEnd = false; const stream = new ReadableStream({ async pull(controller) { if (reachedEnd) { controller.close(); return; } try { if (expectedCount !== null && nextSeq >= expectedCount) { reachedEnd = true; controller.close(); return; } const tx1 = db.transaction('chunks','readonly'); const store1 = tx1.objectStore('chunks'); const row = await new Promise((res, rej) => { const g = store1.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); }); if (row) { const blob = row.blob || new Blob([row.ab], { type: mimeType }); const ab = await blob.arrayBuffer(); controller.enqueue(new Uint8Array(ab)); nextSeq = (row.seq || nextSeq) + 1; return; } const tx2 = db.transaction('chunks','readonly'); const store2 = tx2.objectStore('chunks'); const range = IDBKeyRange.bound([sessionId, nextSeq], [sessionId, Number.MAX_SAFE_INTEGER]); const req = store2.openCursor(range); const cursor = await new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); }); if (!cursor) { reachedEnd = true; controller.close(); return; } const row2 = cursor.value; const blob2 = row2.blob || new Blob([row2.ab], { type: mimeType }); const ab2 = await blob2.arrayBuffer(); controller.enqueue(new Uint8Array(ab2)); nextSeq = (row2.seq || nextSeq) + 1; } catch (e) { controller.error(e); } } }); const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] }); const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 }); const output = new Output({ format: new WebMOutputFormat(), target }); const conversion = await Conversion.init({ input, output }); conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); }; await conversion.execute(); try { await writable.close(); } catch(_) {} }
-    async function buildSessionIndex(sessionId, mimeType) { const db = await idbOpenDB(); const sess = await new Promise((res, rej) => { const tx = db.transaction('sessions','readonly'); const r = tx.objectStore('sessions').get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); const count = sess?.chunkCount ?? null; if (!count || count <= 0) throw new Error('Session has no chunks'); const sizes = new Array(count); let total = 0; for (let i = 0; i < count; i++) { const tx = db.transaction('chunks','readonly'); const store = tx.objectStore('chunks'); const row = await new Promise((res, rej) => { const g = store.get([sessionId, i]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); }); if (!row) { sizes[i] = 0; continue; } const size = row.blob ? row.blob.size : (row.ab ? row.ab.byteLength : 0); sizes[i] = size; total += size; } if (total === 0) throw new Error('All chunks are empty'); const prefix = new Array(count); let acc = 0; for (let i = 0; i < count; i++) { prefix[i] = acc; acc += sizes[i]; } return { db, count, sizes, prefix, totalSize: total }; }
-    function locateChunkByOffset(prefix, sizes, offset) { let lo = 0, hi = sizes.length - 1, ans = 0; while (lo <= hi) { const mid = (lo + hi) >> 1; if (prefix[mid] <= offset) { ans = mid; lo = mid + 1; } else { hi = mid - 1; } } const seq = ans; const chunkOffset = offset - prefix[seq]; return { seq, chunkOffset }; }
-    async function remuxDebugFromIDBToFile(sessionId, sizeMB, mimeType, writable) { const { Input, Output, WebMOutputFormat, StreamTarget, StreamSource, WEBM, Conversion } = window.Mediabunny; const targetBytes = Math.max(0, Math.floor(sizeMB * 1024 * 1024)); if (targetBytes === 0) throw new Error('Target size must be > 0'); const index = await buildSessionIndex(sessionId, mimeType); const source = new StreamSource({ getSize: () => targetBytes, read: async (start, end) => { const len = end - start; const out = new Uint8Array(len); let written = 0; let pos = start; while (written < len) { const loopOffset = pos % index.totalSize; const { seq, chunkOffset } = locateChunkByOffset(index.prefix, index.sizes, loopOffset); const tx = index.db.transaction('chunks','readonly'); const store = tx.objectStore('chunks'); const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); }); if (!row) throw new Error('Missing chunk during debug read'); const blob = row.blob || new Blob([row.ab], { type: mimeType }); const maxFromChunk = Math.min(blob.size - chunkOffset, len - written); const slice = blob.slice(chunkOffset, chunkOffset + maxFromChunk); const ab = await slice.arrayBuffer(); out.set(new Uint8Array(ab), written); written += ab.byteLength; pos += ab.byteLength; } return out; }, maxCacheSize: 128 * 1024 * 1024, prefetchProfile: 'fileSystem' }); const input = new Input({ source, formats: [WEBM] }); const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 }); const output = new Output({ format: new WebMOutputFormat(), target }); const conversion = await Conversion.init({ input, output }); conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); }; await conversion.execute(); try { await writable.close(); } catch(_) {} }
-    async function remuxDebugFromIDBToBlob(sessionId, sizeMB, mimeType) { const { Input, Output, WebMOutputFormat, BufferTarget, StreamSource, WEBM, Conversion } = window.Mediabunny; const targetBytes = Math.max(0, Math.floor(sizeMB * 1024 * 1024)); if (targetBytes === 0) throw new Error('Target size must be > 0'); const index = await buildSessionIndex(sessionId, mimeType); const source = new StreamSource({ getSize: () => targetBytes, read: async (start, end) => { const len = end - start; const out = new Uint8Array(len); let written = 0; let pos = start; while (written < len) { const loopOffset = pos % index.totalSize; const { seq, chunkOffset } = locateChunkByOffset(index.prefix, index.sizes, loopOffset); const tx = index.db.transaction('chunks','readonly'); const store = tx.objectStore('chunks'); const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); }); if (!row) throw new Error('Missing chunk during debug read'); const blob = row.blob || new Blob([row.ab], { type: mimeType }); const maxFromChunk = Math.min(blob.size - chunkOffset, len - written); const slice = blob.slice(chunkOffset, chunkOffset + maxFromChunk); const ab = await slice.arrayBuffer(); out.set(new Uint8Array(ab), written); written += ab.byteLength; pos += ab.byteLength; } return out; }, maxCacheSize: 128 * 1024 * 1024, prefetchProfile: 'fileSystem' }); const input = new Input({ source, formats: [WEBM] }); const target = new BufferTarget(); const output = new Output({ format: new WebMOutputFormat(), target }); const conversion = await Conversion.init({ input, output }); conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); }; await conversion.execute(); return new Blob([target.buffer], { type: 'video/webm' }); }
-    async function rebuildBlobWebM(blob) { const { Input, Output, WebMOutputFormat, BufferTarget, BlobSource, WEBM, Conversion } = window.Mediabunny; const input = new Input({ source: new BlobSource(blob), formats: [WEBM] }); const target = new BufferTarget(); const output = new Output({ format: new WebMOutputFormat(), target }); const conversion = await Conversion.init({ input, output }); conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); }; await conversion.execute(); return new Blob([target.buffer], { type: 'video/webm' }); }
+    function handleReadyBlob(fixedBlob, elapsedMs) {
+      const url = URL.createObjectURL(fixedBlob);
+      const a = Object.assign(document.createElement('a'), { href: url, download: `screen-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm` });
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      updateProgress(1); setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600);
+    }
+    async function fallbackFromIDB() {
+      const fullBlob = await buildBlobFromIDB(currentSessionId);
+      const fixedBlob = await rebuildBlobWebM(fullBlob);
+      handleReadyBlob(fixedBlob, 0);
+    }
+    async function buildBlobFromIDB(sessionId) {
+      const db = await idbOpenDB();
+      const rows = await new Promise((res, rej) => { const tx = db.transaction('chunks','readonly'); const idx = tx.objectStore('chunks').index('bySession'); const req = idx.getAll(IDBKeyRange.only(sessionId)); req.onsuccess = () => res(req.result.sort((a,b)=>a.seq-b.seq)); req.onerror = () => rej(req.error); });
+      const parts = rows.map((r) => r.blob || new Blob([r.ab], { type: 'video/webm' }));
+      return new Blob(parts, { type: 'video/webm' });
+    }
+    async function remuxToFileFromIDB(sessionId, mimeType, t0, writable) {
+      const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny;
+      try { await writable.truncate?.(0); } catch(_) {}
+      const db = await idbOpenDB();
+      const sess = await new Promise((res, rej) => { const tx = db.transaction('sessions','readonly'); const r = tx.objectStore('sessions').get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      const expectedCount = sess?.chunkCount ?? null;
+      let nextSeq = 0; let reachedEnd = false;
+      const stream = new ReadableStream({
+        async pull(controller) {
+          if (reachedEnd) { controller.close(); return; }
+          try {
+            if (expectedCount !== null && nextSeq >= expectedCount) { reachedEnd = true; controller.close(); return; }
+            const tx1 = db.transaction('chunks','readonly'); const store1 = tx1.objectStore('chunks');
+            const row = await new Promise((res, rej) => { const g = store1.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (row) { const blob = row.blob || new Blob([row.ab], { type: mimeType }); const ab = await blob.arrayBuffer(); controller.enqueue(new Uint8Array(ab)); nextSeq = (row.seq || nextSeq) + 1; return; }
+            const tx2 = db.transaction('chunks','readonly'); const store2 = tx2.objectStore('chunks');
+            const range = IDBKeyRange.bound([sessionId, nextSeq], [sessionId, Number.MAX_SAFE_INTEGER]);
+            const req = store2.openCursor(range);
+            const cursor = await new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); });
+            if (!cursor) { reachedEnd = true; controller.close(); return; }
+            const row2 = cursor.value; const blob2 = row2.blob || new Blob([row2.ab], { type: mimeType });
+            const ab2 = await blob2.arrayBuffer(); controller.enqueue(new Uint8Array(ab2)); nextSeq = (row2.seq || nextSeq) + 1;
+          } catch (e) { controller.error(e); }
+        }
+      });
+      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
+      const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
+      const output = new Output({ format: new WebMOutputFormat(), target });
+      const conversion = await Conversion.init({ input, output });
+      conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
+      await conversion.execute();
+      try { await writable.close(); } catch(_) {}
+    }
+
+    // ==== Отладка: генерация большого входного файла на базе виртуального источника StreamSource ====
+    async function buildSessionIndex(sessionId, mimeType) {
+      const db = await idbOpenDB();
+      const sess = await new Promise((res, rej) => { const tx = db.transaction('sessions','readonly'); const r = tx.objectStore('sessions').get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      const count = sess?.chunkCount ?? null;
+      if (!count || count <= 0) throw new Error('Session has no chunks');
+      const sizes = new Array(count);
+      let total = 0;
+      for (let i = 0; i < count; i++) {
+        const tx = db.transaction('chunks','readonly');
+        const store = tx.objectStore('chunks');
+        const row = await new Promise((res, rej) => { const g = store.get([sessionId, i]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+        if (!row) { sizes[i] = 0; continue; }
+        const size = row.blob ? row.blob.size : (row.ab ? row.ab.byteLength : 0);
+        sizes[i] = size;
+        total += size;
+      }
+      if (total === 0) throw new Error('All chunks are empty');
+      const prefix = new Array(count);
+      let acc = 0; for (let i = 0; i < count; i++) { prefix[i] = acc; acc += sizes[i]; }
+      return { db, count, sizes, prefix, totalSize: total };
+    }
+
+    // Отладка: обычный ремакс 1х, затем добиваем файл до целевого размера нуль-байтами (для теста IO/стриминга)
+    async function remuxOnceToFileAndPad(sessionId, mimeType, handle, sizeMB) {
+      const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny;
+      const targetBytes = Math.max(0, Math.floor(sizeMB * 1024 * 1024));
+      if (targetBytes === 0) throw new Error('Target size must be > 0');
+      const writable = await handle.createWritable({ keepExistingData: false });
+      try { await writable.truncate(0); } catch(_) {}
+
+      let bytesWritten = 0;
+      const counting = {
+        async write(data) {
+          let len = 0;
+          if (data instanceof Uint8Array) len = data.byteLength;
+          else if (data && typeof data === 'object') len = data.size ?? data.byteLength ?? data.length ?? 0;
+          await writable.write(data);
+          bytesWritten += (len|0);
+        },
+        async seek(p) { await writable.seek(p); },
+        async truncate(n) { await writable.truncate(n); bytesWritten = Math.min(bytesWritten, n|0); },
+        async close() { /* postpone close until padding done */ }
+      };
+
+      const db = await idbOpenDB();
+      const sess = await new Promise((res, rej) => { const tx = db.transaction('sessions','readonly'); const r = tx.objectStore('sessions').get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      const expectedCount = sess?.chunkCount ?? null;
+      let nextSeq = 0; let reachedEnd = false;
+      const stream = new ReadableStream({
+        async pull(controller) {
+          if (reachedEnd) { controller.close(); return; }
+          try {
+            if (expectedCount !== null && nextSeq >= expectedCount) { reachedEnd = true; controller.close(); return; }
+            const tx1 = db.transaction('chunks','readonly'); const store1 = tx1.objectStore('chunks');
+            const row = await new Promise((res, rej) => { const g = store1.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (!row) { reachedEnd = true; controller.close(); return; }
+            const blob = row.blob || new Blob([row.ab], { type: mimeType });
+            const ab = await blob.arrayBuffer();
+            controller.enqueue(new Uint8Array(ab));
+            nextSeq = (row.seq || nextSeq) + 1;
+          } catch (e) { controller.error(e); }
+        }
+      });
+
+      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
+      const target = new StreamTarget(counting, { chunked: true, chunkSize: 16 * 1024 * 1024 });
+      const output = new Output({ format: new WebMOutputFormat(), target });
+      const conversion = await Conversion.init({ input, output });
+      conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
+      await conversion.execute();
+
+      const padChunk = new Uint8Array(16 * 1024 * 1024);
+      while (bytesWritten < targetBytes) {
+        const remain = targetBytes - bytesWritten;
+        if (remain <= 0) break;
+        if (remain < padChunk.length) {
+          await writable.write(padChunk.subarray(0, remain));
+          bytesWritten += remain;
+          break;
+        }
+        await writable.write(padChunk);
+        bytesWritten += padChunk.length;
+      }
+      await writable.close();
+    }
+
+    function locateChunkByOffset(prefix, sizes, offset) {
+      // binary search over prefix sums to find largest index with prefix[i] <= offset
+      let lo = 0, hi = sizes.length - 1, ans = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (prefix[mid] <= offset) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+      }
+      const seq = ans;
+      const chunkOffset = offset - prefix[seq];
+      return { seq, chunkOffset };
+    }
+
+    async function remuxDebugFromIDBToFile(sessionId, sizeMB, mimeType, writable) {
+      const { Input, Output, WebMOutputFormat, StreamTarget, StreamSource, WEBM, Conversion } = window.Mediabunny;
+      const targetBytes = Math.max(0, Math.floor(sizeMB * 1024 * 1024));
+      if (targetBytes === 0) throw new Error('Target size must be > 0');
+      const index = await buildSessionIndex(sessionId, mimeType);
+      const source = new StreamSource({
+        getSize: () => targetBytes,
+        read: async (start, end) => {
+          const len = end - start;
+          const out = new Uint8Array(len);
+          let written = 0;
+          let pos = start;
+          while (written < len) {
+            const loopOffset = pos % index.totalSize;
+            const { seq, chunkOffset } = locateChunkByOffset(index.prefix, index.sizes, loopOffset);
+            const tx = index.db.transaction('chunks','readonly');
+            const store = tx.objectStore('chunks');
+            const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (!row) throw new Error('Missing chunk during debug read');
+            const blob = row.blob || new Blob([row.ab], { type: mimeType });
+            const maxFromChunk = Math.min(blob.size - chunkOffset, len - written);
+            const slice = blob.slice(chunkOffset, chunkOffset + maxFromChunk);
+            const ab = await slice.arrayBuffer();
+            out.set(new Uint8Array(ab), written);
+            written += ab.byteLength;
+            pos += ab.byteLength;
+          }
+          return out;
+        },
+        maxCacheSize: 128 * 1024 * 1024,
+        prefetchProfile: 'fileSystem'
+      });
+      const input = new Input({ source, formats: [WEBM] });
+      const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
+      const output = new Output({ format: new WebMOutputFormat(), target });
+      const conversion = await Conversion.init({ input, output });
+      conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
+      await conversion.execute();
+      try { await writable.close(); } catch(_) {}
+    }
+
+    async function remuxDebugFromIDBToBlob(sessionId, sizeMB, mimeType) {
+      const { Input, Output, WebMOutputFormat, BufferTarget, StreamSource, WEBM, Conversion } = window.Mediabunny;
+      const targetBytes = Math.max(0, Math.floor(sizeMB * 1024 * 1024));
+      if (targetBytes === 0) throw new Error('Target size must be > 0');
+      const index = await buildSessionIndex(sessionId, mimeType);
+      const source = new StreamSource({
+        getSize: () => targetBytes,
+        read: async (start, end) => {
+          const len = end - start;
+          const out = new Uint8Array(len);
+          let written = 0;
+          let pos = start;
+          while (written < len) {
+            const loopOffset = pos % index.totalSize;
+            const { seq, chunkOffset } = locateChunkByOffset(index.prefix, index.sizes, loopOffset);
+            const tx = index.db.transaction('chunks','readonly');
+            const store = tx.objectStore('chunks');
+            const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (!row) throw new Error('Missing chunk during debug read');
+            const blob = row.blob || new Blob([row.ab], { type: mimeType });
+            const maxFromChunk = Math.min(blob.size - chunkOffset, len - written);
+            const slice = blob.slice(chunkOffset, chunkOffset + maxFromChunk);
+            const ab = await slice.arrayBuffer();
+            out.set(new Uint8Array(ab), written);
+            written += ab.byteLength;
+            pos += ab.byteLength;
+          }
+          return out;
+        },
+        maxCacheSize: 128 * 1024 * 1024,
+        prefetchProfile: 'fileSystem'
+      });
+      const input = new Input({ source, formats: [WEBM] });
+      const target = new BufferTarget();
+      const output = new Output({ format: new WebMOutputFormat(), target });
+      const conversion = await Conversion.init({ input, output });
+      conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
+      await conversion.execute();
+      return new Blob([target.buffer], { type: 'video/webm' });
+    }
+    async function rebuildBlobWebM(blob) {
+      const { Input, Output, WebMOutputFormat, BufferTarget, BlobSource, WEBM, Conversion } = window.Mediabunny;
+      const input = new Input({ source: new BlobSource(blob), formats: [WEBM] });
+      const target = new BufferTarget();
+      const output = new Output({ format: new WebMOutputFormat(), target });
+      const conversion = await Conversion.init({ input, output });
+      conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
+      await conversion.execute();
+      return new Blob([target.buffer], { type: 'video/webm' });
+    }
 
     startBtn.onclick = startRecording; stopBtn.onclick = stopRecording;
   </script>
