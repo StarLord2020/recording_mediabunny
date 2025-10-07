@@ -220,40 +220,36 @@
 
       // Реализуем поток из IDB через курсор и backpressure: отдаём следующий чанк только когда потребитель запросит
       const db = await idbOpenDB();
-      const tx = db.transaction('chunks','readonly');
-      const idx = tx.objectStore('chunks').index('bySession');
-      const req = idx.openCursor(IDBKeyRange.only(sessionId));
-
-      let cursor = await new Promise((res, rej) => {
-        req.onsuccess = () => res(req.result);
-        req.onerror = () => rej(req.error);
-      });
-      let done = !cursor;
-
+      // Будем читать по одному чанку за pull, создавая короткоживущую транзакцию каждый раз
+      let nextSeq = 0;
+      let reachedEnd = false;
       const stream = new ReadableStream({
         async pull(controller) {
-          if (done) {
+          if (reachedEnd) {
             controller.close();
             return;
           }
+          // Открываем транзакцию только для одного курсорного шага
+          const tx = db.transaction('chunks', 'readonly');
+          const store = tx.objectStore('chunks'); // keyPath: ['sessionId','seq']
+          const range = IDBKeyRange.lowerBound([sessionId, nextSeq]);
+          const req = store.openCursor(range);
+          const cursor = await new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); });
+          if (!cursor) {
+            reachedEnd = true;
+            controller.close();
+            return;
+          }
+          const row = cursor.value;
+          nextSeq = (row.seq || 0) + 1;
           try {
-            const row = cursor.value;
             const blob = row.blob || new Blob([row.ab], { type: mimeType });
             const ab = await blob.arrayBuffer();
             controller.enqueue(new Uint8Array(ab));
-            cursor.continue();
-            cursor = await new Promise((res, rej) => {
-              req.onsuccess = () => res(req.result);
-              req.onerror = () => rej(req.error);
-            });
-            done = !cursor;
           } catch (e) {
             controller.error(e);
           }
         },
-        cancel() {
-          try { tx.abort(); } catch (_) {}
-        }
       });
 
       // Важное: увеличиваем кеш источника, чтобы избежать обратного чтения «до кэшированного региона»
