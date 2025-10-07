@@ -220,6 +220,15 @@
 
       // Реализуем поток из IDB через курсор и backpressure: отдаём следующий чанк только когда потребитель запросит
       const db = await idbOpenDB();
+      // Получаем метаданные сессии, включая ожидаемое количество чанков
+      const sess = await new Promise((res, rej) => {
+        const tx = db.transaction('sessions','readonly');
+        const r = tx.objectStore('sessions').get(sessionId);
+        r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+      });
+      if (!sess) throw new Error('Session not found');
+      const expectedCount = typeof sess.chunkCount === 'number' ? sess.chunkCount : null;
+
       // Будем читать по одному чанку за pull, создавая короткоживущую транзакцию каждый раз
       let nextSeq = 0;
       let reachedEnd = false;
@@ -229,23 +238,44 @@
             controller.close();
             return;
           }
-          // Открываем транзакцию только для одного курсорного шага
-          const tx = db.transaction('chunks', 'readonly');
-          const store = tx.objectStore('chunks'); // keyPath: ['sessionId','seq']
-          const range = IDBKeyRange.lowerBound([sessionId, nextSeq]);
-          const req = store.openCursor(range);
-          const cursor = await new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); });
-          if (!cursor) {
-            reachedEnd = true;
-            controller.close();
-            return;
-          }
-          const row = cursor.value;
-          nextSeq = (row.seq || 0) + 1;
           try {
-            const blob = row.blob || new Blob([row.ab], { type: mimeType });
-            const ab = await blob.arrayBuffer();
-            controller.enqueue(new Uint8Array(ab));
+            // Если знаем ожидаемое число чанков и всё уже прочитано — закрываемся
+            if (expectedCount !== null && nextSeq >= expectedCount) {
+              reachedEnd = true;
+              controller.close();
+              return;
+            }
+            // Быстрый путь: точечный get по составному ключу
+            const tx1 = db.transaction('chunks', 'readonly');
+            const store1 = tx1.objectStore('chunks');
+            const row = await new Promise((res, rej) => {
+              const g = store1.get([sessionId, nextSeq]);
+              g.onsuccess = () => res(g.result);
+              g.onerror = () => rej(g.error);
+            });
+            if (row) {
+              const blob = row.blob || new Blob([row.ab], { type: mimeType });
+              const ab = await blob.arrayBuffer();
+              controller.enqueue(new Uint8Array(ab));
+              nextSeq = (row.seq || nextSeq) + 1;
+              return;
+            }
+            // Запасной путь: курсор в рамках текущей сессии, начиная с nextSeq
+            const tx2 = db.transaction('chunks', 'readonly');
+            const store2 = tx2.objectStore('chunks');
+            const range = IDBKeyRange.bound([sessionId, nextSeq], [sessionId, Number.MAX_SAFE_INTEGER]);
+            const req = store2.openCursor(range);
+            const cursor = await new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); });
+            if (!cursor) {
+              reachedEnd = true;
+              controller.close();
+              return;
+            }
+            const row2 = cursor.value;
+            const blob2 = row2.blob || new Blob([row2.ab], { type: mimeType });
+            const ab2 = await blob2.arrayBuffer();
+            controller.enqueue(new Uint8Array(ab2));
+            nextSeq = (row2.seq || nextSeq) + 1;
           } catch (e) {
             controller.error(e);
           }
