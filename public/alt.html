@@ -56,6 +56,28 @@
     <button id="refreshSessionsBtn">🔄</button>
   </div>
 
+  <fieldset style="margin:10px 0; padding:8px; border:1px solid #ddd; border-radius:6px;">
+    <legend>Варианты обработки выбранной сессии</legend>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+      <label>Cache (MB): <input id="optCacheMB" type="number" min="0" step="16" value="64" style="width:80px;"></label>
+      <label>Prefetch: 
+        <select id="optPrefetch">
+          <option value="none">none</option>
+          <option value="fileSystem" selected>fileSystem</option>
+          <option value="network">network</option>
+        </select>
+      </label>
+      <label><input id="optAudioTrans" type="checkbox"> Audio forceTranscode</label>
+      <label><input id="optVideoTrans" type="checkbox"> Video forceTranscode</label>
+      <label>Pad (MB, optional): <input id="optPadMB" type="number" min="0" step="100" value="0" style="width:100px;"></label>
+    </div>
+    <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+      <button id="btnSSFile">▶ StreamSource → файл</button>
+      <button id="btnSSBlob">⬇ StreamSource → Blob (скачать)</button>
+      <button id="btnRSFile">▶ ReadableStreamSource (курсор) → файл</button>
+    </div>
+  </fieldset>
+
   <script>
     // Простая обёртка над текущей логикой из index.html — используем те же helper'ы
     const preview = document.getElementById('preview');
@@ -68,6 +90,14 @@
     const procSelectedBtn = document.getElementById('procSelectedBtn');
     const sessionSelect = document.getElementById('sessionSelect');
     const refreshSessionsBtn = document.getElementById('refreshSessionsBtn');
+    const optCacheMB = document.getElementById('optCacheMB');
+    const optPrefetch = document.getElementById('optPrefetch');
+    const optAudioTrans = document.getElementById('optAudioTrans');
+    const optVideoTrans = document.getElementById('optVideoTrans');
+    const optPadMB = document.getElementById('optPadMB');
+    const btnSSFile = document.getElementById('btnSSFile');
+    const btnSSBlob = document.getElementById('btnSSBlob');
+    const btnRSFile = document.getElementById('btnRSFile');
 
     let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let fsHandle = null; let idbWriter = null; let currentSessionId = null;
     let firstChunkBlob = null; // для генерации большого входа
@@ -442,6 +472,190 @@
     };
     refreshSessionsBtn.onclick = loadSessionsIntoSelect;
     loadSessionsIntoSelect();
+
+    // ====== Варианты обработки выбранной сессии ======
+    btnSSFile.onclick = async () => {
+      const sel = sessionSelect.value; if (!sel) { alert('Выберите сессию'); return; }
+      const mime = sessionSelect.options[sessionSelect.selectedIndex]?.dataset?.mime || 'video/webm';
+      if (!window.showSaveFilePicker) { alert('Нужен File System Access API'); return; }
+      const cacheMB = Math.max(0, Number(optCacheMB.value||0));
+      const prefetch = optPrefetch.value;
+      const forceAudio = !!optAudioTrans.checked;
+      const forceVideo = !!optVideoTrans.checked;
+      const padMB = Math.max(0, Number(optPadMB.value||0));
+      const handle = await window.showSaveFilePicker({ suggestedName: `debug-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types: [{ description:'WebM', accept: {'video/webm':['.webm']}}] });
+      await remuxSelected_StreamSource_toFile({ sessionId: sel, mimeType: mime, handle, cacheMB, prefetch, forceAudio, forceVideo, padMB });
+      alert('Готово: файл записан');
+    };
+
+    btnSSBlob.onclick = async () => {
+      const sel = sessionSelect.value; if (!sel) { alert('Выберите сессию'); return; }
+      const mime = sessionSelect.options[sessionSelect.selectedIndex]?.dataset?.mime || 'video/webm';
+      const cacheMB = Math.max(0, Number(optCacheMB.value||0));
+      const prefetch = optPrefetch.value;
+      const forceAudio = !!optAudioTrans.checked;
+      const forceVideo = !!optVideoTrans.checked;
+      await remuxSelected_StreamSource_toBlob({ sessionId: sel, mimeType: mime, cacheMB, prefetch, forceAudio, forceVideo });
+    };
+
+    btnRSFile.onclick = async () => {
+      const sel = sessionSelect.value; if (!sel) { alert('Выберите сессию'); return; }
+      const mime = sessionSelect.options[sessionSelect.selectedIndex]?.dataset?.mime || 'video/webm';
+      if (!window.showSaveFilePicker) { alert('Нужен File System Access API'); return; }
+      const cacheMB = Math.max(0, Number(optCacheMB.value||0));
+      const forceAudio = !!optAudioTrans.checked;
+      const forceVideo = !!optVideoTrans.checked;
+      const padMB = Math.max(0, Number(optPadMB.value||0));
+      const handle = await window.showSaveFilePicker({ suggestedName: `debug-rs-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types: [{ description:'WebM', accept: {'video/webm':['.webm']}}] });
+      await remuxSelected_ReadableStreamSource_toFile({ sessionId: sel, mimeType: mime, handle, cacheMB, forceAudio, forceVideo, padMB });
+      alert('Готово: файл записан');
+    };
+
+    // Implementations
+    async function remuxSelected_StreamSource_toFile(opts) {
+      const { sessionId, mimeType, handle, cacheMB, prefetch, forceAudio, forceVideo, padMB } = opts;
+      const { Input, Output, WebMOutputFormat, StreamTarget, StreamSource, Conversion } = window.Mediabunny;
+      const writable = await handle.createWritable({ keepExistingData: false });
+      try { await writable.truncate(0); } catch(_) {}
+      const { db, count, sizes, prefix, totalSize } = await buildSessionIndex(sessionId, mimeType);
+      const source = new StreamSource({
+        getSize: () => totalSize,
+        read: async (start, end) => {
+          const len = end - start; const out = new Uint8Array(len);
+          let written = 0; let pos = start;
+          while (written < len) {
+            const { seq, chunkOffset } = locateChunkByOffset(prefix, sizes, pos);
+            const tx = db.transaction('chunks','readonly'); const store = tx.objectStore('chunks');
+            const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (!row) throw new Error('Missing chunk');
+            const blob = row.blob || new Blob([row.ab], { type: mimeType });
+            const take = Math.min(blob.size - chunkOffset, len - written);
+            const ab = await blob.slice(chunkOffset, chunkOffset + take).arrayBuffer();
+            out.set(new Uint8Array(ab), written);
+            written += ab.byteLength; pos += ab.byteLength;
+          }
+          return out;
+        },
+        maxCacheSize: Math.max(0, (cacheMB|0)) * 1024 * 1024,
+        prefetchProfile: prefetch || 'none'
+      });
+      const input = new Input({ source, formats: [WebM] ?? [window.Mediabunny.WEBM] });
+      // Correct formats arg: use window.Mediabunny.WEBM
+      const input2 = new Input({ source, formats: [window.Mediabunny.WEBM] });
+      // Wrap file stream into WritableStream for StreamTarget
+      const sink = new WritableStream({
+        async write(chunk) {
+          const data = chunk && chunk.data !== undefined ? chunk.data : chunk;
+          const position = chunk && typeof chunk.position === 'number' ? chunk.position : undefined;
+          let u8;
+          if (data instanceof Uint8Array) u8 = data;
+          else if (data?.buffer) u8 = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length || 0);
+          else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+          else { const ab = await new Blob([data]).arrayBuffer(); u8 = new Uint8Array(ab); }
+          if (typeof position === 'number') { try { await writable.seek(position); } catch(_) {} }
+          await writable.write(u8);
+        },
+        async close() {}, async abort() {}
+      }, { highWaterMark: 1 });
+      const target = new StreamTarget(sink, { chunked: true, chunkSize: 16 * 1024 * 1024 });
+      const output = new Output({ format: new WebMOutputFormat(), target });
+      const convOpts = { input: input2, output };
+      if (forceAudio) convOpts.audio = { forceTranscode: true };
+      if (forceVideo) convOpts.video = { forceTranscode: true };
+      const conversion = await Conversion.init(convOpts);
+      conversion.onProgress = (p) => updateProgress(Math.max(0, Math.min(1, p || 0)));
+      await conversion.execute();
+      // pad
+      const padBytes = Math.max(0, (padMB|0) * 1024 * 1024);
+      if (padBytes > 0) {
+        const padChunk = new Uint8Array(16 * 1024 * 1024);
+        let remaining = padBytes;
+        while (remaining > 0) { const slice = remaining < padChunk.length ? padChunk.subarray(0, remaining) : padChunk; await writable.write(slice); remaining -= slice.length; }
+      }
+      await writable.close();
+    }
+
+    async function remuxSelected_StreamSource_toBlob(opts) {
+      const { sessionId, mimeType, cacheMB, prefetch, forceAudio, forceVideo } = opts;
+      const { Input, Output, WebMOutputFormat, BufferTarget, StreamSource, Conversion } = window.Mediabunny;
+      const { db, count, sizes, prefix, totalSize } = await buildSessionIndex(sessionId, mimeType);
+      const source = new StreamSource({
+        getSize: () => totalSize,
+        read: async (start, end) => {
+          const len = end - start; const out = new Uint8Array(len);
+          let written = 0; let pos = start;
+          while (written < len) {
+            const { seq, chunkOffset } = locateChunkByOffset(prefix, sizes, pos);
+            const tx = db.transaction('chunks','readonly'); const store = tx.objectStore('chunks');
+            const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (!row) throw new Error('Missing chunk');
+            const blob = row.blob || new Blob([row.ab], { type: mimeType });
+            const take = Math.min(blob.size - chunkOffset, len - written);
+            const ab = await blob.slice(chunkOffset, chunkOffset + take).arrayBuffer();
+            out.set(new Uint8Array(ab), written);
+            written += ab.byteLength; pos += ab.byteLength;
+          }
+          return out;
+        },
+        maxCacheSize: Math.max(0, (cacheMB|0)) * 1024 * 1024,
+        prefetchProfile: prefetch || 'none'
+      });
+      const input = new Input({ source, formats: [window.Mediabunny.WEBM] });
+      const target = new BufferTarget();
+      const output = new Output({ format: new WebMOutputFormat(), target });
+      const convOpts = { input, output };
+      if (forceAudio) convOpts.audio = { forceTranscode: true };
+      if (forceVideo) convOpts.video = { forceTranscode: true };
+      const conversion = await Conversion.init(convOpts);
+      conversion.onProgress = (p) => updateProgress(Math.max(0, Math.min(1, p || 0)));
+      await conversion.execute();
+      const blob = new Blob([target.buffer], { type: mimeType });
+      const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `debug-${new Date().toISOString().replace(/[:.]/g,'-')}.webm` });
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
+    }
+
+    async function remuxSelected_ReadableStreamSource_toFile(opts) {
+      const { sessionId, mimeType, handle, cacheMB, forceAudio, forceVideo, padMB } = opts;
+      const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, Conversion } = window.Mediabunny;
+      const writable = await handle.createWritable({ keepExistingData: false });
+      try { await writable.truncate(0); } catch(_) {}
+      const db = await idbOpenDB();
+      let nextSeq = 0; let done = false;
+      const stream = new ReadableStream({
+        async pull(controller) {
+          if (done) { controller.close(); return; }
+          const tx = db.transaction('chunks','readonly'); const store = tx.objectStore('chunks');
+          const row = await new Promise((res, rej) => { const g = store.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+          if (!row) { done = true; controller.close(); return; }
+          const blob = row.blob || new Blob([row.ab], { type: mimeType });
+          const ab = await blob.arrayBuffer(); controller.enqueue(new Uint8Array(ab));
+          nextSeq = (row.seq || nextSeq) + 1;
+        }
+      });
+      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: Math.max(0,(cacheMB|0))*1024*1024 }), formats: [window.Mediabunny.WEBM] });
+      const sink = new WritableStream({
+        async write(chunk) {
+          const data = chunk && chunk.data !== undefined ? chunk.data : chunk;
+          const position = chunk && typeof chunk.position === 'number' ? chunk.position : undefined;
+          let u8;
+          if (data instanceof Uint8Array) u8 = data; else if (data?.buffer) u8 = new Uint8Array(data.buffer, data.byteOffset||0, data.byteLength||data.length||0);
+          else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data); else { const ab = await new Blob([data]).arrayBuffer(); u8 = new Uint8Array(ab); }
+          if (typeof position === 'number') { try { await writable.seek(position); } catch(_) {} }
+          await writable.write(u8);
+        }, async close() {}, async abort() {}
+      }, { highWaterMark: 1 });
+      const target = new StreamTarget(sink, { chunked: true, chunkSize: 16 * 1024 * 1024 });
+      const output = new Output({ format: new WebMOutputFormat(), target });
+      const convOpts = { input, output };
+      if (forceAudio) convOpts.audio = { forceTranscode: true };
+      if (forceVideo) convOpts.video = { forceTranscode: true };
+      const conversion = await Conversion.init(convOpts);
+      conversion.onProgress = (p) => updateProgress(Math.max(0, Math.min(1, p || 0)));
+      await conversion.execute();
+      const padBytes = Math.max(0, (padMB|0) * 1024 * 1024);
+      if (padBytes > 0) { const padChunk = new Uint8Array(16 * 1024 * 1024); let remaining = padBytes; while (remaining>0) { const slice = remaining<padChunk.length?padChunk.subarray(0,remaining):padChunk; await writable.write(slice); remaining-=slice.length; } }
+      await writable.close();
+    }
   </script>
 </body>
 </html>
