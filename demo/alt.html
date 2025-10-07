@@ -58,7 +58,7 @@
     const progressBarEl = document.getElementById('progressBar');
     const progressTextEl = document.getElementById('progressText');
 
-    let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let idbWriter = null; let currentSessionId = null;
+    let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let fsHandle = null; let idbWriter = null; let currentSessionId = null;
     let firstChunkBlob = null; // для генерации большого входа
 
     function updateProgress(p) {
@@ -91,11 +91,11 @@
         const debugMB = Number(document.getElementById('debugMB').value || 0);
         if (debugEnabled && debugMB > 0) {
           try {
-            if (fsWritable) {
-              await remuxDebugFromIDBToFile(currentSessionId, debugMB, 'video/webm', fsWritable);
+            if (fsWritable && fsHandle) {
+              await remuxOnceToFileAndPad(currentSessionId, 'video/webm', fsHandle, debugMB);
             } else {
-              const blob = await remuxDebugFromIDBToBlob(currentSessionId, debugMB, 'video/webm');
-              handleReadyBlob(blob, performance.now() - t0);
+              console.warn('Debug big-size requires FS API; falling back to normal remux');
+              await fallbackFromIDB();
             }
           } catch (e) {
             console.warn('Debug remux failed, fallback to IDB path:', e);
@@ -177,7 +177,7 @@
       const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
-      const conversion = await Conversion.init({ input, output });
+      const conversion = await Conversion.init({ input, output, audio: { forceTranscode: true } });
       conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
       await conversion.execute();
       try { await writable.close(); } catch(_) {}
@@ -204,6 +204,70 @@
       const prefix = new Array(count);
       let acc = 0; for (let i = 0; i < count; i++) { prefix[i] = acc; acc += sizes[i]; }
       return { db, count, sizes, prefix, totalSize: total };
+    }
+
+    // Отладка: обычный ремакс 1х, затем добиваем файл до целевого размера нуль-байтами (для теста IO/стриминга)
+    async function remuxOnceToFileAndPad(sessionId, mimeType, handle, sizeMB) {
+      const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny;
+      const targetBytes = Math.max(0, Math.floor(sizeMB * 1024 * 1024));
+      if (targetBytes === 0) throw new Error('Target size must be > 0');
+      const writable = await handle.createWritable({ keepExistingData: false });
+      try { await writable.truncate(0); } catch(_) {}
+
+      let bytesWritten = 0;
+      const counting = {
+        async write(data) {
+          let len = 0;
+          if (data instanceof Uint8Array) len = data.byteLength;
+          else if (data && typeof data === 'object') len = data.size ?? data.byteLength ?? data.length ?? 0;
+          await writable.write(data);
+          bytesWritten += (len|0);
+        },
+        async seek(p) { await writable.seek(p); },
+        async truncate(n) { await writable.truncate(n); bytesWritten = Math.min(bytesWritten, n|0); },
+        async close() { /* postpone close until padding done */ }
+      };
+
+      const db = await idbOpenDB();
+      const sess = await new Promise((res, rej) => { const tx = db.transaction('sessions','readonly'); const r = tx.objectStore('sessions').get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      const expectedCount = sess?.chunkCount ?? null;
+      let nextSeq = 0; let reachedEnd = false;
+      const stream = new ReadableStream({
+        async pull(controller) {
+          if (reachedEnd) { controller.close(); return; }
+          try {
+            if (expectedCount !== null && nextSeq >= expectedCount) { reachedEnd = true; controller.close(); return; }
+            const tx1 = db.transaction('chunks','readonly'); const store1 = tx1.objectStore('chunks');
+            const row = await new Promise((res, rej) => { const g = store1.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (!row) { reachedEnd = true; controller.close(); return; }
+            const blob = row.blob || new Blob([row.ab], { type: mimeType });
+            const ab = await blob.arrayBuffer();
+            controller.enqueue(new Uint8Array(ab));
+            nextSeq = (row.seq || nextSeq) + 1;
+          } catch (e) { controller.error(e); }
+        }
+      });
+
+      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
+      const target = new StreamTarget(counting, { chunked: true, chunkSize: 16 * 1024 * 1024 });
+      const output = new Output({ format: new WebMOutputFormat(), target });
+      const conversion = await Conversion.init({ input, output, audio: { forceTranscode: true } });
+      conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
+      await conversion.execute();
+
+      const padChunk = new Uint8Array(16 * 1024 * 1024);
+      while (bytesWritten < targetBytes) {
+        const remain = targetBytes - bytesWritten;
+        if (remain <= 0) break;
+        if (remain < padChunk.length) {
+          await writable.write(padChunk.subarray(0, remain));
+          bytesWritten += remain;
+          break;
+        }
+        await writable.write(padChunk);
+        bytesWritten += padChunk.length;
+      }
+      await writable.close();
     }
 
     function locateChunkByOffset(prefix, sizes, offset) {
@@ -253,7 +317,7 @@
       const input = new Input({ source, formats: [WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
-      const conversion = await Conversion.init({ input, output });
+      const conversion = await Conversion.init({ input, output, audio: { forceTranscode: true } });
       conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
       await conversion.execute();
       try { await writable.close(); } catch(_) {}

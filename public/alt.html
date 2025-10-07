@@ -177,7 +177,7 @@
       const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
-      const conversion = await Conversion.init({ input, output });
+      const conversion = await Conversion.init({ input, output, audio: { forceTranscode: true } });
       conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
       await conversion.execute();
       try { await writable.close(); } catch(_) {}
@@ -251,7 +251,7 @@
       const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
       const target = new StreamTarget(counting, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
-      const conversion = await Conversion.init({ input, output });
+      const conversion = await Conversion.init({ input, output, audio: { forceTranscode: true } });
       conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
       await conversion.execute();
 
@@ -317,7 +317,7 @@
       const input = new Input({ source, formats: [WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
-      const conversion = await Conversion.init({ input, output });
+      const conversion = await Conversion.init({ input, output, audio: { forceTranscode: true } });
       conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
       await conversion.execute();
       try { await writable.close(); } catch(_) {}
