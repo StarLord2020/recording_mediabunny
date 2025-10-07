@@ -6,7 +6,7 @@
   "description": "UMD bundle wrapper for mediabunny with a no-bundler browser demo",
   "scripts": {
     "build": "rollup -c && npm run prepare:public",
-    "prepare:public": "rm -rf public && mkdir -p public && sed 's#../dist/mediabunny.umd.js#./mediabunny.umd.js#' demo/index.html > public/index.html && cp dist/mediabunny.umd.js public/mediabunny.umd.js && cp demo/remux.worker.js public/remux.worker.js && cp demo/idb-recorder.js public/idb-recorder.js"
+    "prepare:public": "rm -rf public && mkdir -p public && sed 's#../dist/mediabunny.umd.js#./mediabunny.umd.js#' demo/index.html > public/index.html && sed 's#../dist/mediabunny.umd.js#./mediabunny.umd.js#' demo/alt.html > public/alt.html && cp dist/mediabunny.umd.js public/mediabunny.umd.js && cp demo/remux.worker.js public/remux.worker.js && cp demo/idb-recorder.js public/idb-recorder.js"
   },
   "dependencies": {
     "@rollup/plugin-commonjs": "^28.0.6",
