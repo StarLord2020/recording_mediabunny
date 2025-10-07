@@ -215,51 +215,72 @@
     }
 
     async function remuxToFileFromIDB(sessionId, mimeType, t0, writable) {
-      const { Input, Output, WebMOutputFormat, StreamTarget, StreamSource, WEBM, Conversion } = window.Mediabunny;
+      const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny;
       try { await writable.truncate?.(0); } catch (_) {}
+
+      // Реализуем поток из IDB через курсор и backpressure: отдаём следующий чанк только когда потребитель запросит
       const db = await idbOpenDB();
-      const sess = await new Promise((res, rej) => { const tx = db.transaction('sessions','readonly'); const r = tx.objectStore('sessions').get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-      if (!sess) throw new Error('Session not found');
-      const count = Number.isInteger(sess.chunkCount) ? sess.chunkCount : 0;
-      if (count <= 0) throw new Error('No chunks recorded');
-      const sizes = new Array(count); let total = 0;
-      for (let i = 0; i < count; i++) {
-        const tx = db.transaction('chunks','readonly'); const store = tx.objectStore('chunks');
-        // eslint-disable-next-line no-await-in-loop
-        const row = await new Promise((res, rej) => { const g = store.get([sessionId, i]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
-        const sz = row?.blob ? row.blob.size : (row?.ab ? row.ab.byteLength : 0);
-        sizes[i] = sz; total += sz;
-      }
-      const prefix = new Array(count); let acc = 0; for (let i = 0; i < count; i++) { prefix[i] = acc; acc += sizes[i]; }
-      const locateByOffset = (offset) => {
-        let lo = 0, hi = count - 1, ans = 0;
-        while (lo <= hi) { const mid = (lo + hi) >> 1; if (prefix[mid] <= offset) { ans = mid; lo = mid + 1; } else { hi = mid - 1; } }
-        const seq = ans; const chunkOffset = offset - prefix[seq]; return { seq, chunkOffset };
-      };
-      const source = new StreamSource({
-        getSize: () => total,
-        read: async (start, end) => {
-          const len = end - start; const out = new Uint8Array(len);
-          let written = 0; let pos = start;
-          while (written < len) {
-            const { seq, chunkOffset } = locateByOffset(pos);
-            const tx = db.transaction('chunks','readonly'); const store = tx.objectStore('chunks');
-            // eslint-disable-next-line no-await-in-loop
-            const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
-            if (!row) throw new Error('Missing chunk during read');
-            const blob = row.blob || new Blob([row.ab], { type: mimeType });
-            const take = Math.min(blob.size - chunkOffset, len - written);
-            // eslint-disable-next-line no-await-in-loop
-            const ab = await blob.slice(chunkOffset, chunkOffset + take).arrayBuffer();
-            out.set(new Uint8Array(ab), written);
-            written += ab.byteLength; pos += ab.byteLength;
-          }
-          return out;
-        },
-        maxCacheSize: 128 * 1024 * 1024,
-        prefetchProfile: 'fileSystem'
+      const sess = await new Promise((res, rej) => {
+        const tx = db.transaction('sessions','readonly');
+        const r = tx.objectStore('sessions').get(sessionId);
+        r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
       });
-      const input = new Input({ source, formats: [WEBM] });
+      if (!sess) throw new Error('Session not found');
+      const expectedCount = typeof sess.chunkCount === 'number' ? sess.chunkCount : null;
+
+      let nextSeq = 0;
+      let reachedEnd = false;
+      const stream = new ReadableStream({
+        async pull(controller) {
+          if (reachedEnd) {
+            controller.close();
+            return;
+          }
+          try {
+            if (expectedCount !== null && nextSeq >= expectedCount) {
+              reachedEnd = true;
+              controller.close();
+              return;
+            }
+            // Быстрый путь: точечный get по составному ключу
+            const tx1 = db.transaction('chunks', 'readonly');
+            const store1 = tx1.objectStore('chunks');
+            const row = await new Promise((res, rej) => {
+              const g = store1.get([sessionId, nextSeq]);
+              g.onsuccess = () => res(g.result);
+              g.onerror = () => rej(g.error);
+            });
+            if (row) {
+              const blob = row.blob || new Blob([row.ab], { type: mimeType });
+              const ab = await blob.arrayBuffer();
+              controller.enqueue(new Uint8Array(ab));
+              nextSeq = (row.seq || nextSeq) + 1;
+              return;
+            }
+            // Запасной путь: курсор в рамках текущей сессии, начиная с nextSeq
+            const tx2 = db.transaction('chunks', 'readonly');
+            const store2 = tx2.objectStore('chunks');
+            const range = IDBKeyRange.bound([sessionId, nextSeq], [sessionId, Number.MAX_SAFE_INTEGER]);
+            const req = store2.openCursor(range);
+            const cursor = await new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); });
+            if (!cursor) {
+              reachedEnd = true;
+              controller.close();
+              return;
+            }
+            const row2 = cursor.value;
+            const blob2 = row2.blob || new Blob([row2.ab], { type: mimeType });
+            const ab2 = await blob2.arrayBuffer();
+            controller.enqueue(new Uint8Array(ab2));
+            nextSeq = (row2.seq || nextSeq) + 1;
+          } catch (e) {
+            controller.error(e);
+          }
+        },
+      });
+
+      // Увеличиваем кеш источника, чтобы избежать обратного чтения «до кэшированного региона»
+      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output });
