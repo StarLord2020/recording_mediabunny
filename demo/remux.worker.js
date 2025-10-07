@@ -28,6 +28,7 @@ self.onmessage = async (e) => {
     const input = new Input({ source: new BlobSource(fullBlob), formats: [WEBM] });
 
     let output;
+    let ask = null;
     if (mode === 'stream' && port) {
       // Create a WritableStream that proxies writes to the main thread via MessagePort
       let msgId = 0;
@@ -42,7 +43,7 @@ self.onmessage = async (e) => {
           pending.delete(d.id);
         }
       };
-      const ask = (type, payload = {}, transfer = []) => new Promise((resolve, reject) => {
+      ask = (type, payload = {}, transfer = []) => new Promise((resolve, reject) => {
         const id = msgId++;
         pending.set(id, { resolve, reject });
         try {
@@ -89,6 +90,12 @@ self.onmessage = async (e) => {
       self.postMessage({ type: 'progress', progress: clamped });
     };
     await conversion.execute();
+
+
+    // Ensure the underlying file gets closed in stream mode
+    if (mode === 'stream' && port && ask) {
+      try { await ask('close'); } catch (_) {}
+    }
 
     const t1 = (self.performance?.now?.() ?? Date.now());
     if (mode === 'stream' && port) {
