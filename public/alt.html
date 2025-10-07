@@ -91,16 +91,20 @@
         const debugMB = Number(document.getElementById('debugMB').value || 0);
         if (debugEnabled && debugMB > 0) {
           try {
-            if (fsWritable && fsHandle) {
-              await remuxOnceToFileAndPad(currentSessionId, 'video/webm', fsHandle, debugMB);
-            } else {
-              console.warn('Debug big-size requires FS API; falling back to normal remux');
-              await fallbackFromIDB();
+            if (!window.showSaveFilePicker) {
+              alert('Для отладки больших файлов нужен File System Access API (Chrome/Edge).');
+              return;
             }
+            if (!fsHandle) {
+              fsHandle = await window.showSaveFilePicker({
+                suggestedName: `debug-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`,
+                types: [{ description: 'WebM Video', accept: { 'video/webm': ['.webm'] } }]
+              });
+            }
+            await remuxOnceToFileAndPad(currentSessionId, 'video/webm', fsHandle, debugMB);
           } catch (e) {
-            console.warn('Debug remux failed, fallback to IDB path:', e);
-            if (fsWritable) { try { await fsWritable.close(); } catch (_) {} }
-            await fallbackFromIDB();
+            console.warn('Debug remux to file failed:', e);
+            alert('Не удалось записать в файл в режиме отладки.');
           }
         } else if (fsWritable && currentSessionId) {
           try { await remuxToFileFromIDB(currentSessionId, 'video/webm', t0, fsWritable); }
@@ -122,9 +126,6 @@
       updateRecTime(0); recTimerId = setInterval(() => updateRecTime(performance.now() - recStartMs), 250);
     }
     async function stopRecording() {
-      if (window.showSaveFilePicker && !fsWritable) {
-        try { const handle = await window.showSaveFilePicker({ suggestedName: `screen-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types: [{ description: 'WebM Video', accept: { 'video/webm': ['.webm'] } }] }); fsWritable = await handle.createWritable(); try { await fsWritable.truncate(0); } catch(_) {} } catch(e) { console.warn('FS API pick cancelled/failed:', e); }
-      }
       recorder.stop(); startBtn.disabled = false; stopBtn.disabled = true;
       if (preview.srcObject) { preview.srcObject.getTracks().forEach(t => t.stop()); preview.srcObject = null; }
       if (recTimerId) { clearInterval(recTimerId); recTimerId = null; }
@@ -206,9 +207,9 @@
       return { db, count, sizes, prefix, totalSize: total };
     }
 
-    // Отладка: обычный ремакс 1х, затем добиваем файл до целевого размера нуль-байтами (для теста IO/стриминга)
+    // Отладка: обычный ремакс 1х через StreamSource (без cache-miss), затем паддинг до целевого размера
     async function remuxOnceToFileAndPad(sessionId, mimeType, handle, sizeMB) {
-      const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny;
+      const { Input, Output, WebMOutputFormat, StreamTarget, StreamSource, WEBM, Conversion } = window.Mediabunny;
       const targetBytes = Math.max(0, Math.floor(sizeMB * 1024 * 1024));
       if (targetBytes === 0) throw new Error('Target size must be > 0');
       const writable = await handle.createWritable({ keepExistingData: false });
@@ -227,28 +228,30 @@
         async truncate(n) { await writable.truncate(n); bytesWritten = Math.min(bytesWritten, n|0); },
         async close() { /* postpone close until padding done */ }
       };
-
-      const db = await idbOpenDB();
-      const sess = await new Promise((res, rej) => { const tx = db.transaction('sessions','readonly'); const r = tx.objectStore('sessions').get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-      const expectedCount = sess?.chunkCount ?? null;
-      let nextSeq = 0; let reachedEnd = false;
-      const stream = new ReadableStream({
-        async pull(controller) {
-          if (reachedEnd) { controller.close(); return; }
-          try {
-            if (expectedCount !== null && nextSeq >= expectedCount) { reachedEnd = true; controller.close(); return; }
-            const tx1 = db.transaction('chunks','readonly'); const store1 = tx1.objectStore('chunks');
-            const row = await new Promise((res, rej) => { const g = store1.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
-            if (!row) { reachedEnd = true; controller.close(); return; }
+      // Построим индекс и виртуальный источник с произвольным доступом
+      const { db, count, sizes, prefix, totalSize } = await buildSessionIndex(sessionId, mimeType);
+      const source = new StreamSource({
+        getSize: () => totalSize,
+        read: async (start, end) => {
+          const len = end - start; const out = new Uint8Array(len);
+          let written = 0; let pos = start;
+          while (written < len) {
+            const { seq, chunkOffset } = locateChunkByOffset(prefix, sizes, pos);
+            const tx = db.transaction('chunks','readonly'); const store = tx.objectStore('chunks');
+            const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (!row) throw new Error('Missing chunk');
             const blob = row.blob || new Blob([row.ab], { type: mimeType });
-            const ab = await blob.arrayBuffer();
-            controller.enqueue(new Uint8Array(ab));
-            nextSeq = (row.seq || nextSeq) + 1;
-          } catch (e) { controller.error(e); }
-        }
+            const take = Math.min(blob.size - chunkOffset, len - written);
+            const ab = await blob.slice(chunkOffset, chunkOffset + take).arrayBuffer();
+            out.set(new Uint8Array(ab), written);
+            written += ab.byteLength; pos += ab.byteLength;
+          }
+          return out;
+        },
+        maxCacheSize: 128 * 1024 * 1024,
+        prefetchProfile: 'fileSystem'
       });
-
-      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
+      const input = new Input({ source, formats: [WEBM] });
       const target = new StreamTarget(counting, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output, audio: { forceTranscode: true } });
