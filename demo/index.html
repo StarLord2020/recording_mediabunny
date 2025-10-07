@@ -217,33 +217,47 @@
     async function remuxToFileFromIDB(sessionId, mimeType, t0, writable) {
       const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny;
       try { await writable.truncate?.(0); } catch (_) {}
+
+      // Реализуем поток из IDB через курсор и backpressure: отдаём следующий чанк только когда потребитель запросит
       const db = await idbOpenDB();
-      const sess = await new Promise((res, rej) => {
-        const tx = db.transaction('sessions','readonly');
-        const r = tx.objectStore('sessions').get(sessionId);
-        r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
-      });
-      if (!sess) throw new Error('Session not found');
-      const rows = await new Promise((res, rej) => {
-        const tx = db.transaction('chunks','readonly');
-        const idx = tx.objectStore('chunks').index('bySession');
-        const req = idx.getAll(IDBKeyRange.only(sessionId));
-        req.onsuccess = () => res(req.result.sort((a,b)=>a.seq-b.seq));
+      const tx = db.transaction('chunks','readonly');
+      const idx = tx.objectStore('chunks').index('bySession');
+      const req = idx.openCursor(IDBKeyRange.only(sessionId));
+
+      let cursor = await new Promise((res, rej) => {
+        req.onsuccess = () => res(req.result);
         req.onerror = () => rej(req.error);
       });
+      let done = !cursor;
+
       const stream = new ReadableStream({
-        async start(controller) {
-          try {
-            for (const row of rows) {
-              const blob = row.blob || new Blob([row.ab], { type: mimeType });
-              const ab = await blob.arrayBuffer();
-              controller.enqueue(new Uint8Array(ab));
-            }
+        async pull(controller) {
+          if (done) {
             controller.close();
-          } catch (e) { controller.error(e); }
+            return;
+          }
+          try {
+            const row = cursor.value;
+            const blob = row.blob || new Blob([row.ab], { type: mimeType });
+            const ab = await blob.arrayBuffer();
+            controller.enqueue(new Uint8Array(ab));
+            cursor.continue();
+            cursor = await new Promise((res, rej) => {
+              req.onsuccess = () => res(req.result);
+              req.onerror = () => rej(req.error);
+            });
+            done = !cursor;
+          } catch (e) {
+            controller.error(e);
+          }
+        },
+        cancel() {
+          try { tx.abort(); } catch (_) {}
         }
       });
-      const input = new Input({ source: new ReadableStreamSource(stream), formats: [WEBM] });
+
+      // Важное: увеличиваем кеш источника, чтобы избежать обратного чтения «до кэшированного региона»
+      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output });
@@ -297,6 +311,21 @@
       // Скрыть прогресс
       updateProgress(1);
       setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600);
+    }
+
+    // Хелпер для фолбэка: ремакс из одного Blob (без стриминга)
+    async function rebuildBlobWebM(blob) {
+      const { Input, Output, WebMOutputFormat, BufferTarget, BlobSource, WEBM, Conversion } = window.Mediabunny;
+      const input = new Input({ source: new BlobSource(blob), formats: [WEBM] });
+      const target = new BufferTarget();
+      const output = new Output({ format: new WebMOutputFormat(), target });
+      const conversion = await Conversion.init({ input, output });
+      conversion.onProgress = (p) => {
+        const percent = Math.max(0, Math.min(1, p));
+        updateProgress(percent);
+      };
+      await conversion.execute();
+      return new Blob([target.buffer], { type: 'video/webm' });
     }
   </script>
 </body>
