@@ -78,6 +78,7 @@ export function createStreamSourceForSession(index, options={}) {
   const { StreamSource } = window.Mediabunny;
   const maxCacheSize = Math.max(0, (options.cacheMB|0) * 1024 * 1024) || (128*1024*1024);
   const prefetchProfile = options.prefetch || 'fileSystem';
+  let servedBytes = 0;
   return new StreamSource({
     getSize: () => index.totalSize,
     read: async (start, end) => {
@@ -96,6 +97,8 @@ export function createStreamSourceForSession(index, options={}) {
         out.set(new Uint8Array(ab), written);
         written += ab.byteLength; pos += ab.byteLength;
       }
+      servedBytes += len;
+      try { options.onByteProgress?.(Math.max(0, Math.min(1, servedBytes / index.totalSize))); } catch(_) {}
       return out;
     },
     maxCacheSize,
@@ -122,7 +125,7 @@ export function wrapFileWritableAsSink(fileWritable) {
 export async function remuxSessionToFile(sessionId, handle, opts={}) {
   const { Input, Output, WebMOutputFormat, StreamTarget, Conversion } = window.Mediabunny;
   const index = await buildSessionIndex(sessionId, opts.mimeType || 'video/webm', opts.onIndexProgress);
-  const source = createStreamSourceForSession(index, { cacheMB: opts.cacheMB, prefetch: opts.prefetch });
+  const source = createStreamSourceForSession(index, { cacheMB: opts.cacheMB, prefetch: opts.prefetch, onByteProgress: opts.onByteProgress });
   const input = new Input({ source, formats: [window.Mediabunny.WEBM] });
   const writable = await handle.createWritable({ keepExistingData: false });
   try { await writable.truncate(0); } catch(_) {}
@@ -145,7 +148,7 @@ export async function remuxSessionToFile(sessionId, handle, opts={}) {
 export async function remuxSessionToBlob(sessionId, opts={}) {
   const { Input, Output, WebMOutputFormat, BufferTarget, StreamSource, Conversion } = window.Mediabunny;
   const index = await buildSessionIndex(sessionId, opts.mimeType || 'video/webm', opts.onIndexProgress);
-  const source = createStreamSourceForSession(index, { cacheMB: opts.cacheMB, prefetch: opts.prefetch });
+  const source = createStreamSourceForSession(index, { cacheMB: opts.cacheMB, prefetch: opts.prefetch, onByteProgress: opts.onByteProgress });
   const input = new Input({ source, formats: [window.Mediabunny.WEBM] });
   const target = new BufferTarget();
   const output = new Output({ format: new WebMOutputFormat(), target });
