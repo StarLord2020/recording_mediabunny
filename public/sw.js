@@ -54,10 +54,25 @@ async function handleDownload(url, clientId) {
   // Create a ReadableStream for HTTP response and a WritableStream sink for StreamTarget
   let rsController = null;
   const readable = new ReadableStream({ start(c) { rsController = c; send({ type:'sw-log', phase:'stream', message:'readable started' }); } });
+  // Reordering sink to respect random-access writes from StreamTarget
+  let nextOffset = 0;
+  const pending = new Map(); // position:number -> Uint8Array
+  const tryFlush = () => {
+    let loop = 0;
+    while (true) {
+      const chunk = pending.get(nextOffset);
+      if (!chunk) break;
+      pending.delete(nextOffset);
+      rsController.enqueue(chunk);
+      nextOffset += chunk.byteLength;
+      loop++;
+      if ((loop & 0xF) === 0) send({ type:'sw-log', phase:'bytes', progressHint: nextOffset });
+    }
+  };
   const writable = new WritableStream({
     async write(chunk) {
-      // StreamTarget may pass { type:'write', data: Uint8Array, position?: number } or raw Uint8Array
       try {
+        const position = (chunk && typeof chunk.position === 'number') ? chunk.position : undefined;
         const data = (chunk && chunk.data !== undefined) ? chunk.data : chunk;
         let u8;
         if (data instanceof Uint8Array) {
@@ -70,14 +85,24 @@ async function handleDownload(url, clientId) {
           const ab = await new Blob([data]).arrayBuffer();
           u8 = new Uint8Array(ab);
         }
-        rsController.enqueue(u8);
+        const pos = (position === undefined) ? nextOffset : position;
+        if (pos === nextOffset) {
+          rsController.enqueue(u8);
+          nextOffset += u8.byteLength;
+          tryFlush();
+        } else if (pos > nextOffset) {
+          pending.set(pos, u8);
+        } else {
+          // duplicate/overlap — игнорируем
+          send({ type:'sw-log', phase:'sink-write', message:`duplicate pos=${pos} < next=${nextOffset}` });
+        }
       } catch (err) {
         send({ type:'sw-error', phase:'sink-write', message: String(err && err.message || err) });
         try { rsController.close(); } catch(_) {}
         throw err;
       }
     },
-    close() { try { rsController.close(); send({ type:'sw-log', phase:'stream', message:'readable closed' }); } catch(_) {} },
+    close() { try { tryFlush(); rsController.close(); send({ type:'sw-log', phase:'stream', message:'readable closed' }); } catch(_) {} },
     abort(reason) { send({ type:'sw-error', phase:'sink-abort', message: String(reason||'') }); try { rsController.close(); } catch(_) {} }
   }, { highWaterMark: 1 });
 
@@ -138,7 +163,7 @@ async function handleDownload(url, clientId) {
         prefetchProfile: 'fileSystem'
       });
       const input = new Input({ source, formats: [self.Mediabunny.WEBM] });
-      const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
+      const target = new StreamTarget(writable, { chunked: true, chunkSize: 8 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output });
       send({ type: 'sw-log', phase: 'convert', message: 'start' });
