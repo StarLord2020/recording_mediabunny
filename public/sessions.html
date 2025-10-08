@@ -61,7 +61,7 @@
   </fieldset>
 
   <script type="module">
-    import { listSessionsSorted, remuxSessionToFile, remuxSessionToBlob, buildSessionIndex, groupChunksByTargetSize, remuxChunkRangeToBlob } from './services/remuxService.js';
+    import { listSessionsSorted, remuxSessionToFile, remuxSessionToBlob, buildSessionIndex, computeSessionDuration, remuxIndexWindowToBlob } from './services/remuxService.js';
 
     const selectEl = document.getElementById('sessionSelect');
     const refreshBtn = document.getElementById('refreshBtn');
@@ -207,22 +207,23 @@
         const t0 = performance.now();
         // Строим индекс один раз
         const index = await buildSessionIndex(id, 'video/webm', setIndexProgress);
-        // Разбиваем на группы чанков по ~целевому размеру
+        // Оцениваем длительность и делим по времени на окна под размер части
         const targetBytes = Math.max(256, Number(partMBEl.value||1024)) * 1024 * 1024;
-        const groups = groupChunksByTargetSize(index, targetBytes);
+        const duration = await computeSessionDuration(index, { cacheMB: Number(cacheMBEl.value||0), prefetch: prefetchEl.value });
+        const bitrate = index.totalSize / Math.max(1, duration);
+        let windowSec = Math.max(5, targetBytes / Math.max(1, bitrate));
         let partIndex = 1;
-        for (const g of groups) {
+        for (let start = 0; start < duration; ) {
+          const end = Math.min(duration, start + windowSec);
           setProgress(0); setLibProgress(0); resetFinalize();
-          const blob = await remuxChunkRangeToBlob(index, {
-            startSeq: g.startSeq, endSeq: g.endSeq,
+          const blob = await remuxIndexWindowToBlob(index, {
+            startSec: start, endSec: end,
             cacheMB: Number(cacheMBEl.value||0), prefetch: prefetchEl.value,
             forceAudio: !!forceAudioEl.checked, forceVideo: !!forceVideoEl.checked,
             onProgress: setLibProgress,
             onByteProgress: setProgress
           });
-          // краткая финализация между частями
           startFinalize();
-          // Скачиваем часть
           const a = Object.assign(document.createElement('a'), {
             href: URL.createObjectURL(blob),
             download: `session-${new Date().toISOString().replace(/[:.]/g,'-')}.part${String(partIndex).padStart(3,'0')}.webm`
@@ -230,7 +231,7 @@
           document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
           endFinalize();
           setTimeout(()=> { setLibProgress(0); setProgress(0); }, 400);
-          partIndex += 1;
+          partIndex += 1; start = end;
         }
         const t1 = performance.now();
         totalTimeText.textContent = `Итого: ${((t1 - t0)/1000).toFixed(1)} с`;
