@@ -38,13 +38,18 @@ self.addEventListener('fetch', (event) => {
 });
 
 async function handleDownload(url, clientId) {
-  const sessionId = url.searchParams.get('session');
-  const filename = url.searchParams.get('name') || `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
-  const mimeType = 'video/webm';
-  if (!sessionId) return new Response('Missing session', { status: 400 });
-  if (!self.Mediabunny) return new Response('Mediabunny not available in SW', { status: 500 });
+  try {
+    const sessionId = url.searchParams.get('session');
+    const filename = url.searchParams.get('name') || `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
+    const mimeType = 'video/webm';
+    if (!sessionId) return new Response('Missing session', { status: 400 });
+    if (!self.Mediabunny) return new Response('Mediabunny not available in SW', { status: 500 });
 
   const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, Conversion } = self.Mediabunny;
+
+  // Prepare client messaging first
+  const client = clientId ? await self.clients.get(clientId) : null;
+  const send = (payload) => { try { client?.postMessage({ source: 'mb-sw', ...payload }); } catch(_) {} };
 
   // Create a ReadableStream for HTTP response and a WritableStream sink for StreamTarget
   let rsController = null;
@@ -75,9 +80,6 @@ async function handleDownload(url, clientId) {
     close() { try { rsController.close(); send({ type:'sw-log', phase:'stream', message:'readable closed' }); } catch(_) {} },
     abort(reason) { send({ type:'sw-error', phase:'sink-abort', message: String(reason||'') }); try { rsController.close(); } catch(_) {} }
   }, { highWaterMark: 1 });
-
-  const client = clientId ? await self.clients.get(clientId) : null;
-  const send = (payload) => { try { client?.postMessage({ source: 'mb-sw', ...payload }); } catch(_) {} };
 
   (async () => {
     try {
@@ -147,9 +149,12 @@ async function handleDownload(url, clientId) {
     }
   })();
 
-  const headers = new Headers({
-    'Content-Type': mimeType,
-    'Content-Disposition': `attachment; filename="${filename}"`
-  });
-  return new Response(readable, { status: 200, headers });
+    const headers = new Headers({
+      'Content-Type': mimeType,
+      'Content-Disposition': `attachment; filename="${filename}"`
+    });
+    return new Response(readable, { status: 200, headers });
+  } catch (err) {
+    return new Response('SW init error: ' + String(err && err.message || err), { status: 500 });
+  }
 }
