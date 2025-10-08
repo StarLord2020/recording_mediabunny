@@ -110,7 +110,7 @@
     const btnRSFile = document.getElementById('btnRSFile');
     const codecSelect = document.getElementById('codecSelect');
 
-    let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let fsHandle = null; let idbWriter = null; let currentSessionId = null;
+    let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let fsHandle = null; let idbWriter = null; let currentSessionId = null; let dataPulseId = null;
     let firstChunkBlob = null; // для генерации большого входа
 
     function updateProgress(p) {
@@ -164,11 +164,14 @@
         currentSessionId = await idbWriter.start({ filenameBase: 'screen-recording', mimeType: sessMime, roomId: undefined });
       } catch (_) { idbWriter = null; currentSessionId = null; }
       recorder.ondataavailable = e => {
+        console.log('ondataavailable', { size: e?.data?.size || 0, type: e?.data?.type });
         if (e.data && e.data.size > 0) {
           if (!firstChunkBlob) firstChunkBlob = e.data;
           try { idbWriter?.enqueue(e.data); } catch (err) { console.warn('IDB enqueue failed:', err); }
         }
       };
+      recorder.onerror = (ev) => { console.error('MediaRecorder error:', ev?.error || ev); };
+      recorder.onstart = () => { console.log('MediaRecorder started with', recorder.mimeType); };
       recorder.onstop = async () => {
         progressEl.style.display = ''; progressTextEl.style.display = ''; updateProgress(0);
         const t0 = performance.now();
@@ -208,6 +211,8 @@
       const [vtrack] = stream.getVideoTracks();
       if (vtrack) vtrack.onended = () => { if (recorder && recorder.state === 'recording') stopRecording(); };
       recorder.start(1000);
+      try { if (recorder?.state === 'recording') recorder.requestData(); } catch(_) {}
+      dataPulseId = setInterval(() => { try { if (recorder && recorder.state === 'recording') recorder.requestData(); } catch(_) {} }, 1000);
       startBtn.disabled = true; stopBtn.disabled = false;
       recStartMs = performance.now(); document.getElementById('recInfo').style.display = '';
       updateRecTime(0); recTimerId = setInterval(() => updateRecTime(performance.now() - recStartMs), 250);
@@ -216,6 +221,7 @@
       recorder.stop(); startBtn.disabled = false; stopBtn.disabled = true;
       if (preview.srcObject) { preview.srcObject.getTracks().forEach(t => t.stop()); preview.srcObject = null; }
       if (recTimerId) { clearInterval(recTimerId); recTimerId = null; }
+      if (dataPulseId) { clearInterval(dataPulseId); dataPulseId = null; }
       document.getElementById('recInfo').style.display = 'none';
       try { await idbWriter?.stop(); } catch(_) {}
       idbWriter = null;

@@ -83,6 +83,7 @@
 
     let recorder;
     let recTimerId = null;
+    let dataPulseId = null; // Firefox fallback: force requestData()
     let recStartMs = 0;
     let worker = null;
     let fsWritable = null; // FileSystemWritableFileStream
@@ -139,11 +140,14 @@
       }
 
       recorder.ondataavailable = e => {
+        console.log('ondataavailable', { size: e?.data?.size || 0, type: e?.data?.type });
         // Пишем чанк сразу в IndexedDB, локальный массив не используем
         if (e.data && e.data.size > 0) {
           try { idbWriter?.enqueue(e.data); } catch (err) { console.warn('IDB enqueue failed:', err); }
         }
       };
+      recorder.onerror = (ev) => { console.error('MediaRecorder error:', ev?.error || ev); };
+      recorder.onstart = () => { console.log('MediaRecorder started with', recorder.mimeType); };
 
       recorder.onstop = async () => {
         console.log("⏳ Пересборка WebM (remux) в фоновом потоке...");
@@ -181,6 +185,11 @@
       if (vtrack) vtrack.onended = () => { if (recorder && recorder.state === 'recording') stopRecording(); };
 
       recorder.start(1000); // писать чанками по 1с
+      // Firefox иногда игнорирует timeslice — попросим данные вручную
+      try { if (recorder?.state === 'recording') recorder.requestData(); } catch(_) {}
+      dataPulseId = setInterval(() => {
+        try { if (recorder && recorder.state === 'recording') recorder.requestData(); } catch (e) { /* ignore */ }
+      }, 1000);
       startBtn.disabled = true;
       stopBtn.disabled = false;
 
@@ -220,6 +229,7 @@
       }
 
       if (recTimerId) { clearInterval(recTimerId); recTimerId = null; }
+      if (dataPulseId) { clearInterval(dataPulseId); dataPulseId = null; }
       document.getElementById('recInfo').style.display = 'none';
 
       // Завершаем IDB-сессию (не блокируем критический путь)
