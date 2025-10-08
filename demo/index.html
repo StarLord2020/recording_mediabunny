@@ -41,6 +41,15 @@
   </div>
   <div class="progress__text" id="progressText" style="display:none">0%</div>
 
+  <div style="margin:12px 10px; font: 13px system-ui, sans-serif;">
+    <strong>Обработка существующей сессии</strong>
+    <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <select id="sessionSelect" style="min-width:320px;"></select>
+      <button id="refreshSessionsBtn">🔄 Обновить</button>
+      <button id="processSelectedBtn">💾 Собрать выбранную в файл</button>
+    </div>
+  </div>
+
   <!-- Результат не отображаем во встроенном плеере, экономим память -->
 
   <script>
@@ -50,6 +59,9 @@
     const progressEl = document.getElementById('progress');
     const progressBarEl = document.getElementById('progressBar');
     const progressTextEl = document.getElementById('progressText');
+    const sessionSelectEl = document.getElementById('sessionSelect');
+    const refreshSessionsBtn = document.getElementById('refreshSessionsBtn');
+    const processSelectedBtn = document.getElementById('processSelectedBtn');
 
     let recorder;
     let recTimerId = null;
@@ -188,6 +200,8 @@
 
     startBtn.onclick = startRecording;
     stopBtn.onclick = stopRecording;
+    refreshSessionsBtn.onclick = loadSessionsIntoSelect;
+    processSelectedBtn.onclick = processSelectedSession;
 
     function updateProgress(p) {
       const clamped = Math.max(0, Math.min(1, p));
@@ -201,6 +215,50 @@
       const s = (totalSec % 60).toString().padStart(2,'0');
       document.getElementById('recTime').textContent = `${m}:${s}`;
     }
+
+    async function loadSessionsIntoSelect() {
+      try {
+        sessionSelectEl.innerHTML = '';
+        const sessions = await idbListSessions();
+        sessions.sort((a,b)=> (b.startedAt||0) - (a.startedAt||0));
+        for (const s of sessions) {
+          const started = s.startedAt ? new Date(s.startedAt).toLocaleString() : 'без даты';
+          const opt = document.createElement('option');
+          opt.value = s.id;
+          opt.textContent = `${started} — ${s.chunkCount||0} чанков`;
+          opt.dataset.mime = s.mimeType || 'video/webm';
+          sessionSelectEl.appendChild(opt);
+        }
+      } catch (e) {
+        console.warn('loadSessionsIntoSelect failed:', e);
+      }
+    }
+
+    async function processSelectedSession() {
+      try {
+        const sessId = sessionSelectEl.value;
+        if (!sessId) { alert('Выберите сессию'); return; }
+        if (!window.showSaveFilePicker) { alert('Нужен File System Access API (Chrome/Edge)'); return; }
+        const mime = sessionSelectEl.options[sessionSelectEl.selectedIndex]?.dataset?.mime || 'video/webm';
+        const handle = await window.showSaveFilePicker({
+          suggestedName: `screen-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`,
+          types: [{ description: 'WebM Video', accept: { 'video/webm': ['.webm'] } }]
+        });
+        const writable = await handle.createWritable({ keepExistingData: false });
+        try { await writable.truncate(0); } catch(_) {}
+        progressEl.style.display = '';
+        progressTextEl.style.display = '';
+        updateProgress(0);
+        const t0 = performance.now();
+        await remuxToFileFromIDB(sessId, mime, t0, writable);
+      } catch (e) {
+        console.warn('Process selected session failed:', e);
+        alert('Не удалось собрать выбранную сессию');
+      }
+    }
+
+    // Подгрузим список сессий при загрузке страницы
+    loadSessionsIntoSelect();
 
     async function remuxInWorker() {
       try {
