@@ -177,6 +177,9 @@
       recorder.onstop = async () => {
         progressEl.style.display = ''; progressTextEl.style.display = ''; updateProgress(0);
         const t0 = performance.now();
+        // Дождаться финального dataavailable и записи всех чанков в IDB
+        try { await new Promise(r => setTimeout(r, 250)); } catch(_) {}
+        try { await idbWriter?.flush?.(); } catch(_) {}
         const debugEnabled = document.getElementById('debugEnable').checked;
         const debugMB = Number(document.getElementById('debugMB').value || 0);
         if (debugEnabled && debugMB > 0) {

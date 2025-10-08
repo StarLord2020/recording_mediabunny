@@ -160,6 +160,10 @@
 
         const t0 = performance.now();
 
+        // Дождаться финального dataavailable и записи всех чанков в IDB (Firefox может эмитить его после onstop)
+        try { await new Promise(r => setTimeout(r, 250)); } catch(_) {}
+        try { await idbWriter?.flush?.(); } catch(_) {}
+
         // Если доступна запись в файл — делаем ремакс из IndexedDB прямо в файл (надёжнее)
         if (fsWritable && currentSessionId) {
           try {

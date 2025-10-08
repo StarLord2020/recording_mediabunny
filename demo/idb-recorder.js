@@ -33,6 +33,18 @@ class IDBWriter {
     this.mimeType = '';
   }
 
+  async flush() {
+    // Wait until internal queue is drained and the last tx completes
+    // Small backoff loop to avoid busy waiting
+    for (let i = 0; i < 500; i++) { // ~5s max at 10ms
+      if (!this.pumping && this.queue.length === 0) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise(r => setTimeout(r, 10));
+    }
+    // Give IDB a moment to finalize the last transaction
+    await new Promise(r => setTimeout(r, 20));
+  }
+
   async start({ filenameBase, mimeType, roomId }) {
     const db = await this.dbPromise;
     this.sessionId = crypto.randomUUID();
