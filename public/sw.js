@@ -164,8 +164,9 @@ async function handleDownload(url, clientId) {
       });
       const input = new Input({ source, formats: [self.Mediabunny.WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 8 * 1024 * 1024 });
-      const output = new Output({ format: new WebMOutputFormat(), target });
+      const output = new Output({ format: new WebMOutputFormat({ appendOnly: true }), target });
       const conversion = await Conversion.init({ input, output });
+      conversion.onProgress = (p) => { try { send({ type:'sw-log', phase:'lib', progress: Math.max(0, Math.min(1, p||0)) }); } catch(_) {} };
       send({ type: 'sw-log', phase: 'convert', message: 'start' });
       await conversion.execute();
       send({ type: 'sw-log', phase: 'done', message: 'complete' });
