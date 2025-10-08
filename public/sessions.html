@@ -19,6 +19,8 @@
     <button id="refreshBtn">🔄 Обновить</button>
     <button id="toFileBtn">💾 Сохранить в файл</button>
     <button id="toBlobBtn">⬇ Скачать как файл</button>
+    <label>Размер части (МБ): <input id="partMB" type="number" min="256" step="256" value="1024" style="width:100px;"></label>
+    <button id="toPartsBtn">🧩 Скачать по частям</button>
   </div>
   <fieldset style="margin:8px 0; padding:8px; border:1px solid #ddd; border-radius:6px;">
     <legend>Параметры</legend>
@@ -59,12 +61,14 @@
   </fieldset>
 
   <script type="module">
-    import { listSessionsSorted, remuxSessionToFile, remuxSessionToBlob } from './services/remuxService.js';
+    import { listSessionsSorted, remuxSessionToFile, remuxSessionToBlob, buildSessionIndex, computeSessionDuration, remuxIndexWindowToBlob } from './services/remuxService.js';
 
     const selectEl = document.getElementById('sessionSelect');
     const refreshBtn = document.getElementById('refreshBtn');
     const toFileBtn = document.getElementById('toFileBtn');
     const toBlobBtn = document.getElementById('toBlobBtn');
+    const toPartsBtn = document.getElementById('toPartsBtn');
+    const partMBEl = document.getElementById('partMB');
     const cacheMBEl = document.getElementById('cacheMB');
     const prefetchEl = document.getElementById('prefetch');
     const forceAudioEl = document.getElementById('forceAudio');
@@ -189,6 +193,49 @@
       } catch (e) {
         console.warn('toBlob failed', e);
         alert('Не удалось собрать в Blob');
+      }
+    };
+
+    toPartsBtn.onclick = async () => {
+      try {
+        const id = selectEl.value; if (!id) { alert('Выберите сессию'); return; }
+        setProgress(0); setLibProgress(0); setIndexProgress(0); resetFinalize();
+        const t0 = performance.now();
+        // Строим индекс один раз
+        const index = await buildSessionIndex(id, 'video/webm', setIndexProgress);
+        // Оцениваем длительность
+        const duration = await computeSessionDuration(index, { cacheMB: Number(cacheMBEl.value||0), prefetch: prefetchEl.value });
+        // Оцениваем длительность части по целевому размеру
+        const targetBytes = Math.max(256, Number(partMBEl.value||1024)) * 1024 * 1024;
+        const bitrate = index.totalSize / Math.max(1, duration); // bytes per second
+        let windowSec = Math.max(5, targetBytes / Math.max(1, bitrate));
+        // Идём по окнам
+        let start = 0; let partIndex = 1;
+        while (start < duration) {
+          const end = Math.min(duration, start + windowSec);
+          setLibProgress(0);
+          startFinalize(); // финализация между окнами может занимать время — показываем движение
+          const blob = await remuxIndexWindowToBlob(index, {
+            startSec: start, endSec: end,
+            cacheMB: Number(cacheMBEl.value||0), prefetch: prefetchEl.value,
+            forceAudio: !!forceAudioEl.checked, forceVideo: !!forceVideoEl.checked,
+            onProgress: setLibProgress
+          });
+          endFinalize();
+          // Скачиваем часть
+          const a = Object.assign(document.createElement('a'), {
+            href: URL.createObjectURL(blob),
+            download: `session-${new Date().toISOString().replace(/[:.]/g,'-')}.part${String(partIndex).padStart(3,'0')}.webm`
+          });
+          document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
+          partIndex += 1; start = end;
+        }
+        const t1 = performance.now();
+        totalTimeText.textContent = `Итого: ${((t1 - t0)/1000).toFixed(1)} с`;
+        setLibProgress(0); setProgress(0); setIndexProgress(0); resetFinalize();
+      } catch (e) {
+        console.warn('toParts failed', e);
+        alert('Не удалось скачать по частям');
       }
     };
 

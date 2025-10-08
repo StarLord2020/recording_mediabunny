@@ -106,6 +106,15 @@ export function createStreamSourceForSession(index, options={}) {
   });
 }
 
+export async function computeSessionDuration(index, options={}) {
+  const { Input } = window.Mediabunny;
+  const source = createStreamSourceForSession(index, options);
+  const input = new Input({ source, formats: [window.Mediabunny.WEBM] });
+  const dur = await input.computeDuration();
+  try { input.dispose?.(); } catch(_) {}
+  return dur;
+}
+
 export function wrapFileWritableAsSink(fileWritable) {
   return new WritableStream({
     async write(chunk) {
@@ -153,6 +162,21 @@ export async function remuxSessionToBlob(sessionId, opts={}) {
   const target = new BufferTarget();
   const output = new Output({ format: new WebMOutputFormat(), target });
   const convOpts = { input, output };
+  if (opts.forceAudio) convOpts.audio = { forceTranscode: true };
+  if (opts.forceVideo) convOpts.video = { forceTranscode: true };
+  const conversion = await Conversion.init(convOpts);
+  conversion.onProgress = (p) => { opts.onProgress?.(Math.max(0, Math.min(1, p||0))); };
+  await conversion.execute();
+  return new Blob([target.buffer], { type: index.mimeType });
+}
+
+export async function remuxIndexWindowToBlob(index, opts={}) {
+  const { Input, Output, WebMOutputFormat, BufferTarget, Conversion } = window.Mediabunny;
+  const source = createStreamSourceForSession(index, { cacheMB: opts.cacheMB, prefetch: opts.prefetch, onByteProgress: opts.onByteProgress });
+  const input = new Input({ source, formats: [window.Mediabunny.WEBM] });
+  const target = new BufferTarget();
+  const output = new Output({ format: new WebMOutputFormat(), target });
+  const convOpts = { input, output, trim: { start: opts.startSec || 0, end: opts.endSec || undefined } };
   if (opts.forceAudio) convOpts.audio = { forceTranscode: true };
   if (opts.forceVideo) convOpts.video = { forceTranscode: true };
   const conversion = await Conversion.init(convOpts);
