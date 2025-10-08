@@ -44,6 +44,10 @@
         <div class="progress" style="width:520px"><div class="progress__bar" id="progressBar"></div></div>
         <div id="progressText">Конверсия 0%</div>
       </div>
+      <div>
+        <div class="progress" style="width:520px"><div class="progress__bar" id="progressLibBar"></div></div>
+        <div id="progressLibText">Прогресс библиотеки 0%</div>
+      </div>
     </div>
   </fieldset>
 
@@ -61,6 +65,8 @@
     const padMBEl = document.getElementById('padMB');
     const progressBar = document.getElementById('progressBar');
     const progressText = document.getElementById('progressText');
+    const progressLibBar = document.getElementById('progressLibBar');
+    const progressLibText = document.getElementById('progressLibText');
     const progressIndexBar = document.getElementById('progressIndexBar');
     const progressIndexText = document.getElementById('progressIndexText');
 
@@ -73,6 +79,11 @@
       const v = Math.max(0, Math.min(1, p||0));
       progressIndexBar.style.width = `${(v*100).toFixed(1)}%`;
       progressIndexText.textContent = `Индексация ${(v*100).toFixed(1)}%`;
+    }
+    function setLibProgress(p) {
+      const v = Math.max(0, Math.min(1, p||0));
+      progressLibBar.style.width = `${(v*100).toFixed(1)}%`;
+      progressLibText.textContent = `Прогресс библиотеки ${(v*100).toFixed(1)}%`;
     }
 
     async function loadSessions() {
@@ -103,11 +114,14 @@
           padMB: Number(padMBEl.value||0),
           onIndexProgress: setIndexProgress,
           // Для быстрого старта прогресса используем byte-based прогресс
-          onByteProgress: setProgress
+          onByteProgress: setProgress,
+          // Прогресс от библиотеки Mediabunny
+          onProgress: setLibProgress
         });
         setProgress(1);
         setTimeout(()=> setProgress(0), 800);
         setIndexProgress(0);
+        setLibProgress(0);
       } catch (e) {
         console.warn('toFile failed', e);
         alert('Не удалось записать файл');
@@ -123,13 +137,15 @@
           forceAudio: !!forceAudioEl.checked,
           forceVideo: !!forceVideoEl.checked,
           onIndexProgress: setIndexProgress,
-          onByteProgress: setProgress
+          onByteProgress: setProgress,
+          onProgress: setLibProgress
         });
         const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm` });
         document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
         setProgress(1);
         setTimeout(()=> setProgress(0), 800);
         setIndexProgress(0);
+        setLibProgress(0);
       } catch (e) {
         console.warn('toBlob failed', e);
         alert('Не удалось собрать в Blob');
