@@ -38,19 +38,19 @@
     <div class="row">
       <div>
         <div class="progress" style="width:520px"><div class="progress__bar" id="progressIndexBar"></div></div>
-        <div id="progressIndexText">Индексация 0%</div>
+        <div id="progressIndexText">1) Подготовка (индексация чанков): 0%</div>
       </div>
       <div>
         <div class="progress" style="width:520px"><div class="progress__bar" id="progressBar"></div></div>
-        <div id="progressText">Конверсия 0%</div>
+        <div id="progressText">2) Чтение данных (байты): 0%</div>
       </div>
       <div>
         <div class="progress" style="width:520px"><div class="progress__bar" id="progressLibBar"></div></div>
-        <div id="progressLibText">Прогресс библиотеки 0%</div>
+        <div id="progressLibText">3) Обработка (прогресс библиотеки): 0%</div>
       </div>
       <div>
         <div class="progress" style="width:520px"><div class="progress__bar" id="progressFinalBar"></div></div>
-        <div id="progressFinalText">Финализация 0%</div>
+        <div id="progressFinalText">4) Финализация записи: 0%</div>
       </div>
     </div>
     <div class="row">
@@ -83,23 +83,23 @@
     function setProgress(p) {
       const v = Math.max(0, Math.min(1, p||0));
       progressBar.style.width = `${(v*100).toFixed(1)}%`;
-      progressText.textContent = `Конверсия ${(v*100).toFixed(1)}%`;
+      progressText.textContent = `2) Чтение данных (байты): ${(v*100).toFixed(1)}%`;
     }
     function setIndexProgress(p) {
       const v = Math.max(0, Math.min(1, p||0));
       progressIndexBar.style.width = `${(v*100).toFixed(1)}%`;
-      progressIndexText.textContent = `Индексация ${(v*100).toFixed(1)}%`;
+      progressIndexText.textContent = `1) Подготовка (индексация чанков): ${(v*100).toFixed(1)}%`;
     }
     function setLibProgress(p) {
       const v = Math.max(0, Math.min(1, p||0));
       progressLibBar.style.width = `${(v*100).toFixed(1)}%`;
-      progressLibText.textContent = `Прогресс библиотеки ${(v*100).toFixed(1)}%`;
+      progressLibText.textContent = `3) Обработка (прогресс библиотеки): ${(v*100).toFixed(1)}%`;
     }
     let finalizeTimer = null;
     function startFinalize() {
       if (finalizeTimer) return;
       progressFinalBar.style.width = '5%';
-      progressFinalText.textContent = 'Финализация…';
+      progressFinalText.textContent = '4) Финализация записи: идёт…';
       let w = 5;
       finalizeTimer = setInterval(() => {
         w += 3; if (w > 95) w = 10; // имитация движения
@@ -109,8 +109,13 @@
     function endFinalize() {
       if (finalizeTimer) { clearInterval(finalizeTimer); finalizeTimer = null; }
       progressFinalBar.style.width = '100%';
-      progressFinalText.textContent = 'Финализация 100%';
-      setTimeout(() => { progressFinalBar.style.width = '0%'; progressFinalText.textContent = 'Финализация 0%'; }, 800);
+      progressFinalText.textContent = '4) Финализация записи: 100%';
+      setTimeout(() => { resetFinalize(); }, 800);
+    }
+    function resetFinalize() {
+      if (finalizeTimer) { clearInterval(finalizeTimer); finalizeTimer = null; }
+      progressFinalBar.style.width = '0%';
+      progressFinalText.textContent = '4) Финализация записи: 0%';
     }
 
     async function loadSessions() {
@@ -132,7 +137,7 @@
         const id = selectEl.value; if (!id) { alert('Выберите сессию'); return; }
         if (!window.showSaveFilePicker) { alert('Нужен File System Access API'); return; }
         const handle = await window.showSaveFilePicker({ suggestedName: `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types: [{ description:'WebM', accept: {'video/webm':['.webm']}}] });
-        setProgress(0); setLibProgress(0); setIndexProgress(0); endFinalize();
+        setProgress(0); setLibProgress(0); setIndexProgress(0); resetFinalize();
         const t0 = performance.now();
         await remuxSessionToFile(id, handle, {
           cacheMB: Number(cacheMBEl.value||0),
@@ -150,6 +155,7 @@
         setTimeout(()=> setProgress(0), 800);
         setIndexProgress(0);
         endFinalize();
+        setTimeout(()=> setLibProgress(0), 800);
         const t1 = performance.now();
         totalTimeText.textContent = `Итого: ${((t1 - t0)/1000).toFixed(1)} с`;
       } catch (e) {
@@ -160,7 +166,7 @@
     toBlobBtn.onclick = async () => {
       try {
         const id = selectEl.value; if (!id) { alert('Выберите сессию'); return; }
-        setProgress(0); setLibProgress(0); setIndexProgress(0); endFinalize();
+        setProgress(0); setLibProgress(0); setIndexProgress(0); resetFinalize();
         const t0 = performance.now();
         const blob = await remuxSessionToBlob(id, {
           cacheMB: Number(cacheMBEl.value||0),
@@ -177,6 +183,7 @@
         setTimeout(()=> setProgress(0), 800);
         setIndexProgress(0);
         endFinalize();
+        setTimeout(()=> setLibProgress(0), 800);
         const t1 = performance.now();
         totalTimeText.textContent = `Итого: ${((t1 - t0)/1000).toFixed(1)} с`;
       } catch (e) {
