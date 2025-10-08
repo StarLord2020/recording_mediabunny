@@ -46,9 +46,29 @@ async function handleDownload(url, clientId) {
 
   const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, Conversion } = self.Mediabunny;
 
-  const ts = new TransformStream();
-  const writable = ts.writable;
-  const readable = ts.readable;
+  // Create a ReadableStream for HTTP response and a WritableStream sink for StreamTarget
+  let rsController = null;
+  const readable = new ReadableStream({ start(c) { rsController = c; } });
+  const writable = new WritableStream({
+    async write(chunk) {
+      // StreamTarget may pass { type:'write', data: Uint8Array, position?: number } or raw Uint8Array
+      const data = (chunk && chunk.data !== undefined) ? chunk.data : chunk;
+      let u8;
+      if (data instanceof Uint8Array) {
+        u8 = data;
+      } else if (data?.buffer) {
+        u8 = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length || 0);
+      } else if (data instanceof ArrayBuffer) {
+        u8 = new Uint8Array(data);
+      } else {
+        const ab = await new Blob([data]).arrayBuffer();
+        u8 = new Uint8Array(ab);
+      }
+      rsController.enqueue(u8);
+    },
+    close() { try { rsController.close(); } catch(_) {} },
+    abort() { try { rsController.close(); } catch(_) {} }
+  }, { highWaterMark: 1 });
 
   const client = clientId ? await self.clients.get(clientId) : null;
   const send = (payload) => { try { client?.postMessage({ source: 'mb-sw', ...payload }); } catch(_) {} };
