@@ -141,7 +141,7 @@
       recorder.ondataavailable = e => {
         // Пишем чанк сразу в IndexedDB, локальный массив не используем
         if (e.data && e.data.size > 0) {
-          try { idbWriter?.enqueue(e.data); } catch (_) {}
+          try { idbWriter?.enqueue(e.data); } catch (err) { console.warn('IDB enqueue failed:', err); }
         }
       };
 

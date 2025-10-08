@@ -166,7 +166,7 @@
       recorder.ondataavailable = e => {
         if (e.data && e.data.size > 0) {
           if (!firstChunkBlob) firstChunkBlob = e.data;
-          try { idbWriter?.enqueue(e.data); } catch (_) {}
+          try { idbWriter?.enqueue(e.data); } catch (err) { console.warn('IDB enqueue failed:', err); }
         }
       };
       recorder.onstop = async () => {
