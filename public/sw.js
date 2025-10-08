@@ -145,9 +145,23 @@ async function handleDownload(url, clientId) {
     const headers = new Headers({
       'Content-Type': mimeType,
       'Content-Length': String(file.size),
-      'Content-Disposition': `attachment; filename="${filename}"`
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Cache-Control': 'no-store'
     });
-    return new Response(file.stream(), { status: 200, headers });
+    const reader = file.stream().getReader();
+    const readable = new ReadableStream({
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (done) {
+          try { await root.removeEntry(tmpName); } catch(_) {}
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+      },
+      async cancel() { try { await reader.cancel(); } catch(_) {} try { await root.removeEntry(tmpName); } catch(_) {} }
+    });
+    return new Response(readable, { status: 200, headers });
   } catch (err) {
     return new Response('SW init error: ' + String(err && err.message || err), { status: 500 });
   }
