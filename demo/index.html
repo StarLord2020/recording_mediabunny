@@ -83,8 +83,7 @@
 
     let recorder;
     let recTimerId = null;
-    let dataPulseId = null; // Firefox fallback: force requestData()
-    let gotDataChunk = false; // observed any non-empty chunk
+    // Чанки пишутся стандартной нарезкой MediaRecorder (timeslice)
     let recStartMs = 0;
     let worker = null;
     let fsWritable = null; // FileSystemWritableFileStream
@@ -144,8 +143,6 @@
         console.log('ondataavailable', { size: e?.data?.size || 0, type: e?.data?.type });
         // Пишем чанк сразу в IndexedDB, локальный массив не используем
         if (e.data && e.data.size > 0) {
-          if (!gotDataChunk && dataPulseId) { try { clearInterval(dataPulseId); } catch(_) {} dataPulseId = null; console.log('disabling requestData pulse (chunks flowing)'); }
-          gotDataChunk = true;
           try { idbWriter?.enqueue(e.data); } catch (err) { console.warn('IDB enqueue failed:', err); }
         }
       };
@@ -192,15 +189,6 @@
       if (vtrack) vtrack.onended = () => { if (recorder && recorder.state === 'recording') stopRecording(); };
 
       recorder.start(1000); // писать чанками по 1с
-      // Если чанки не приходят сами (Firefox), включим пульсацию через requestData()
-      gotDataChunk = false;
-      setTimeout(() => {
-        if (!gotDataChunk && recorder && recorder.state === 'recording') {
-          console.log('no chunks yet, enabling requestData pulse');
-          try { recorder.requestData(); } catch(_) {}
-          dataPulseId = setInterval(() => { try { if (recorder && recorder.state === 'recording') recorder.requestData(); } catch(_) {} }, 1000);
-        }
-      }, 1500);
       startBtn.disabled = true;
       stopBtn.disabled = false;
 
@@ -240,7 +228,6 @@
       }
 
       if (recTimerId) { clearInterval(recTimerId); recTimerId = null; }
-      if (dataPulseId) { clearInterval(dataPulseId); dataPulseId = null; }
       document.getElementById('recInfo').style.display = 'none';
 
       // Завершаем IDB-сессию (не блокируем критический путь)
