@@ -110,7 +110,7 @@
     const btnRSFile = document.getElementById('btnRSFile');
     const codecSelect = document.getElementById('codecSelect');
 
-    let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let fsHandle = null; let idbWriter = null; let currentSessionId = null; let dataPulseId = null;
+    let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let fsHandle = null; let idbWriter = null; let currentSessionId = null; let dataPulseId = null; let gotDataChunk = false;
     let firstChunkBlob = null; // для генерации большого входа
 
     function updateProgress(p) {
@@ -166,6 +166,8 @@
       recorder.ondataavailable = e => {
         console.log('ondataavailable', { size: e?.data?.size || 0, type: e?.data?.type });
         if (e.data && e.data.size > 0) {
+          if (!gotDataChunk && dataPulseId) { try { clearInterval(dataPulseId); } catch(_) {} dataPulseId = null; console.log('disabling requestData pulse (chunks flowing)'); }
+          gotDataChunk = true;
           if (!firstChunkBlob) firstChunkBlob = e.data;
           try { idbWriter?.enqueue(e.data); } catch (err) { console.warn('IDB enqueue failed:', err); }
         }
@@ -211,8 +213,14 @@
       const [vtrack] = stream.getVideoTracks();
       if (vtrack) vtrack.onended = () => { if (recorder && recorder.state === 'recording') stopRecording(); };
       recorder.start(1000);
-      try { if (recorder?.state === 'recording') recorder.requestData(); } catch(_) {}
-      dataPulseId = setInterval(() => { try { if (recorder && recorder.state === 'recording') recorder.requestData(); } catch(_) {} }, 1000);
+      gotDataChunk = false;
+      setTimeout(() => {
+        if (!gotDataChunk && recorder && recorder.state === 'recording') {
+          console.log('no chunks yet, enabling requestData pulse');
+          try { recorder.requestData(); } catch(_) {}
+          dataPulseId = setInterval(() => { try { if (recorder && recorder.state === 'recording') recorder.requestData(); } catch(_) {} }, 1000);
+        }
+      }, 1500);
       startBtn.disabled = true; stopBtn.disabled = false;
       recStartMs = performance.now(); document.getElementById('recInfo').style.display = '';
       updateRecTime(0); recTimerId = setInterval(() => updateRecTime(performance.now() - recStartMs), 250);
