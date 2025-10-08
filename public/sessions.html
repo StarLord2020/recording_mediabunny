@@ -213,21 +213,24 @@
         let start = 0; let partIndex = 1;
         while (start < duration) {
           const end = Math.min(duration, start + windowSec);
-          setLibProgress(0);
-          startFinalize(); // финализация между окнами может занимать время — показываем движение
+          setProgress(0); setLibProgress(0); resetFinalize();
           const blob = await remuxIndexWindowToBlob(index, {
             startSec: start, endSec: end,
             cacheMB: Number(cacheMBEl.value||0), prefetch: prefetchEl.value,
             forceAudio: !!forceAudioEl.checked, forceVideo: !!forceVideoEl.checked,
-            onProgress: setLibProgress
+            onProgress: setLibProgress,
+            onByteProgress: setProgress
           });
-          endFinalize();
+          // краткая финализация между частями
+          startFinalize();
           // Скачиваем часть
           const a = Object.assign(document.createElement('a'), {
             href: URL.createObjectURL(blob),
             download: `session-${new Date().toISOString().replace(/[:.]/g,'-')}.part${String(partIndex).padStart(3,'0')}.webm`
           });
           document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
+          endFinalize();
+          setTimeout(()=> { setLibProgress(0); setProgress(0); }, 400);
           partIndex += 1; start = end;
         }
         const t1 = performance.now();
