@@ -51,48 +51,27 @@ async function handleDownload(url, clientId) {
   const client = clientId ? await self.clients.get(clientId) : null;
   const send = (payload) => { try { client?.postMessage({ source: 'mb-sw', ...payload }); } catch(_) {} };
 
-  // Streaming sink with reordering: emits contiguous bytes only (low RAM)
-  let rsController = null;
-  const readable = new ReadableStream({ start(c) { rsController = c; send({ type:'sw-log', phase:'stream', message:'readable started' }); } });
-  let nextOffset = 0;
-  const pending = new Map();
-  const tryFlush = () => {
-    while (true) {
-      const chunk = pending.get(nextOffset);
-      if (!chunk) break;
-      pending.delete(nextOffset);
-      rsController.enqueue(chunk);
-      nextOffset += chunk.byteLength;
-    }
-  };
+  // Use OPFS (Origin Private FS) as random-access sink to keep RAM low
+  const root = await (self.navigator?.storage?.getDirectory?.());
+  if (!root) return new Response('OPFS not available', { status: 500 });
+  const tmpName = `mb-sw-${sessionId}-${Date.now()}.webm`;
+  const fileHandle = await root.getFileHandle(tmpName, { create: true });
+  const fileWritable = await fileHandle.createWritable();
+  try { await fileWritable.truncate(0); } catch(_) {}
   const writable = new WritableStream({
     async write(chunk) {
-      try {
-        const position = (chunk && typeof chunk.position === 'number') ? chunk.position : undefined;
-        const data = (chunk && chunk.data !== undefined) ? chunk.data : chunk;
-        let u8;
-        if (data instanceof Uint8Array) u8 = data;
-        else if (data?.buffer) u8 = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length || 0);
-        else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
-        else { const ab = await new Blob([data]).arrayBuffer(); u8 = new Uint8Array(ab); }
-        const pos = (position === undefined) ? nextOffset : position;
-        if (pos === nextOffset) {
-          rsController.enqueue(u8);
-          nextOffset += u8.byteLength;
-          tryFlush();
-        } else if (pos > nextOffset) {
-          pending.set(pos, u8);
-        } else {
-          // cannot rewrite already-sent bytes
-        }
-      } catch (err) {
-        send({ type:'sw-error', phase:'sink-write', message: String(err && err.message || err) });
-        try { rsController.close(); } catch(_) {}
-        throw err;
-      }
+      const data = (chunk && chunk.data !== undefined) ? chunk.data : chunk;
+      const position = (chunk && typeof chunk.position === 'number') ? chunk.position : undefined;
+      let u8;
+      if (data instanceof Uint8Array) u8 = data;
+      else if (data?.buffer) u8 = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length || 0);
+      else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+      else { const ab = await new Blob([data]).arrayBuffer(); u8 = new Uint8Array(ab); }
+      if (typeof position === 'number') { try { await fileWritable.seek(position); } catch(_) {} }
+      await fileWritable.write(u8);
     },
-    close() { try { tryFlush(); rsController.close(); send({ type:'sw-log', phase:'stream', message:'readable closed' }); } catch(_) {} },
-    abort(reason) { send({ type:'sw-error', phase:'sink-abort', message: String(reason||'') }); try { rsController.close(); } catch(_) {} }
+    async close() { try { await fileWritable.close(); } catch(_) {} },
+    async abort() { try { await fileWritable.abort?.(); } catch(_) {} }
   }, { highWaterMark: 1 });
 
     try {
@@ -152,7 +131,7 @@ async function handleDownload(url, clientId) {
       });
       const input = new Input({ source, formats: [self.Mediabunny.WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 8 * 1024 * 1024 });
-      const output = new Output({ format: new WebMOutputFormat({ appendOnly: true }), target });
+      const output = new Output({ format: new WebMOutputFormat({ appendOnly: false }), target });
       const conversion = await Conversion.init({ input, output });
       conversion.onProgress = (p) => { try { send({ type:'sw-log', phase:'lib', progress: Math.max(0, Math.min(1, p||0)) }); } catch(_) {} };
       send({ type: 'sw-log', phase: 'convert', message: 'start' });
@@ -162,11 +141,13 @@ async function handleDownload(url, clientId) {
       send({ type: 'sw-error', message: String(e && e.message || e) });
       try { const writer = writable.getWriter?.(); await writer?.abort?.(e); } catch(_) {}
     }
+    const file = await fileHandle.getFile();
     const headers = new Headers({
       'Content-Type': mimeType,
+      'Content-Length': String(file.size),
       'Content-Disposition': `attachment; filename="${filename}"`
     });
-    return new Response(readable, { status: 200, headers });
+    return new Response(file.stream(), { status: 200, headers });
   } catch (err) {
     return new Response('SW init error: ' + String(err && err.message || err), { status: 500 });
   }
