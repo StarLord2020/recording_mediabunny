@@ -120,15 +120,16 @@ async function handleDownload(url, clientId) {
             if (!row) throw new Error('Missing chunk');
             const blob = row.blob || new Blob([row.ab], { type: mimeType });
             const take = Math.min(blob.size - chunkOffset, len - written);
+            let ab;
             try {
               // eslint-disable-next-line no-await-in-loop
-              const ab = await blob.slice(chunkOffset, chunkOffset + take).arrayBuffer();
+              ab = await blob.slice(chunkOffset, chunkOffset + take).arrayBuffer();
               out.set(new Uint8Array(ab), written);
             } catch (err) {
               send({ type:'sw-error', phase:'read-slice', message:`seq=${seq} offset=${chunkOffset} len=${take} err=${String(err && err.message || err)}` });
               throw err;
             }
-            written += ab.byteLength; pos += ab.byteLength;
+            written += (ab?.byteLength || 0); pos += (ab?.byteLength || 0);
           }
           served += len; if ((served & ((1<<22)-1)) === 0) send({ type: 'sw-log', phase: 'bytes', progress: served/total });
           return out;
