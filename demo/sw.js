@@ -137,45 +137,63 @@ async function handleDownload(url, clientId) {
       });
       const input = new Input({ source, formats: [self.Mediabunny.WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: chunkMB * 1024 * 1024 });
-      // Allow library to fix headers via random-access writes (still low RAM thanks to OPFS)
       const output = new Output({ format: new WebMOutputFormat({ appendOnly: false }), target });
       const forceAudio = url.searchParams.get('forceAudio') === '1';
       const forceVideo = url.searchParams.get('forceVideo') === '1';
       const convOpts = { input, output };
       if (forceAudio) convOpts.audio = { forceTranscode: true };
       if (forceVideo) convOpts.video = { forceTranscode: true };
-      const conversion = await Conversion.init(convOpts);
-      conversion.onProgress = (p) => { try { send({ type:'sw-log', phase:'lib', progress: Math.max(0, Math.min(1, p||0)) }); } catch(_) {} };
-      send({ type: 'sw-log', phase: 'convert', message: 'start' });
-      await conversion.execute();
-      send({ type: 'sw-log', phase: 'done', message: 'complete' });
+
+      let convResolve, convReject;
+      const convPromise = new Promise((res, rej) => { convResolve = res; convReject = rej; });
+      (async () => {
+        try {
+          const conversion = await Conversion.init(convOpts);
+          conversion.onProgress = (p) => { try { send({ type:'sw-log', phase:'lib', progress: Math.max(0, Math.min(1, p||0)) }); } catch(_) {} };
+          send({ type: 'sw-log', phase: 'convert', message: 'start' });
+          await conversion.execute();
+          send({ type: 'sw-log', phase: 'done', message: 'complete' });
+          convResolve();
+        } catch (e) {
+          send({ type: 'sw-error', message: String(e && e.message || e) });
+          try { const writer = writable.getWriter?.(); await writer?.abort?.(e); } catch(_) {}
+          convReject(e);
+        }
+      })();
+
+      // Immediately return a streaming response; stream waits for conversion completion then reads file
+      const headers = new Headers({
+        'Content-Type': mimeType,
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Cache-Control': 'no-store'
+      });
+      const readable = new ReadableStream({
+        async start(controller) {
+          try {
+            await convPromise;
+            const file = await fileHandle.getFile();
+            const reader = file.stream().getReader();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              controller.enqueue(value);
+            }
+            controller.close();
+            try { await root.removeEntry(tmpName); } catch(_) {}
+          } catch (err) {
+            controller.error(err);
+            try { await root.removeEntry(tmpName); } catch(_) {}
+          }
+        },
+        async cancel() { try { await root.removeEntry(tmpName); } catch(_) {} }
+      });
+      return new Response(readable, { status: 200, headers });
     } catch (e) {
       send({ type: 'sw-error', message: String(e && e.message || e) });
       try { const writer = writable.getWriter?.(); await writer?.abort?.(e); } catch(_) {}
     }
-    // After conversion finishes, stream the file from OPFS to the client (low RAM)
-    const file = await fileHandle.getFile();
-    const headers = new Headers({
-      'Content-Type': mimeType,
-      'Content-Length': String(file.size),
-      'Content-Disposition': `attachment; filename="${filename}"`,
-      'Cache-Control': 'no-store'
-    });
-    // Wrap stream to cleanup temp file when download completes/cancels
-    const reader = file.stream().getReader();
-    const readable = new ReadableStream({
-      async pull(controller) {
-        const { done, value } = await reader.read();
-        if (done) {
-          try { await root.removeEntry(tmpName); } catch(_) {}
-          controller.close();
-        } else {
-          controller.enqueue(value);
-        }
-      },
-      async cancel() { try { await reader.cancel(); } catch(_) {} try { await root.removeEntry(tmpName); } catch(_) {} }
-    });
-    return new Response(readable, { status: 200, headers });
+    // If we failed above, respond with error
+    return new Response('SW conversion error', { status: 500 });
   } catch (err) {
     return new Response('SW init error: ' + String(err && err.message || err), { status: 500 });
   }

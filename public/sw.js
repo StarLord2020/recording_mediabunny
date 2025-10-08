@@ -137,34 +137,50 @@ async function handleDownload(url, clientId) {
       const input = new Input({ source, formats: [self.Mediabunny.WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: chunkMB * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat({ appendOnly: false }), target });
-      const conversion = await Conversion.init({ input, output });
-      conversion.onProgress = (p) => { try { send({ type:'sw-log', phase:'lib', progress: Math.max(0, Math.min(1, p||0)) }); } catch(_) {} };
-      send({ type: 'sw-log', phase: 'convert', message: 'start' });
-      await conversion.execute();
-      send({ type: 'sw-log', phase: 'done', message: 'complete' });
+      let convResolve, convReject;
+      const convPromise = new Promise((res, rej) => { convResolve = res; convReject = rej; });
+      (async () => {
+        try {
+          const conversion = await Conversion.init({ input, output });
+          conversion.onProgress = (p) => { try { send({ type:'sw-log', phase:'lib', progress: Math.max(0, Math.min(1, p||0)) }); } catch(_) {} };
+          send({ type: 'sw-log', phase: 'convert', message: 'start' });
+          await conversion.execute();
+          send({ type: 'sw-log', phase: 'done', message: 'complete' });
+          convResolve();
+        } catch (e) {
+          send({ type: 'sw-error', message: String(e && e.message || e) });
+          try { const writer = writable.getWriter?.(); await writer?.abort?.(e); } catch(_) {}
+          convReject(e);
+        }
+      })();
     } catch (e) {
       send({ type: 'sw-error', message: String(e && e.message || e) });
       try { const writer = writable.getWriter?.(); await writer?.abort?.(e); } catch(_) {}
     }
-    const file = await fileHandle.getFile();
     const headers = new Headers({
       'Content-Type': mimeType,
-      'Content-Length': String(file.size),
       'Content-Disposition': `attachment; filename="${filename}"`,
       'Cache-Control': 'no-store'
     });
-    const reader = file.stream().getReader();
     const readable = new ReadableStream({
-      async pull(controller) {
-        const { done, value } = await reader.read();
-        if (done) {
-          try { await root.removeEntry(tmpName); } catch(_) {}
+      async start(controller) {
+        try {
+          await convPromise;
+          const file = await fileHandle.getFile();
+          const reader = file.stream().getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            controller.enqueue(value);
+          }
           controller.close();
-        } else {
-          controller.enqueue(value);
+          try { await root.removeEntry(tmpName); } catch(_) {}
+        } catch (err) {
+          controller.error(err);
+          try { await root.removeEntry(tmpName); } catch(_) {}
         }
       },
-      async cancel() { try { await reader.cancel(); } catch(_) {} try { await root.removeEntry(tmpName); } catch(_) {} }
+      async cancel() { try { await root.removeEntry(tmpName); } catch(_) {} }
     });
     return new Response(readable, { status: 200, headers });
   } catch (err) {
