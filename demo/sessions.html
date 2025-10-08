@@ -21,6 +21,7 @@
     <button id="toBlobBtn">⬇ Скачать как файл</button>
     <label>Размер части (МБ): <input id="partMB" type="number" min="256" step="256" value="1024" style="width:100px;"></label>
     <button id="toPartsBtn">🧩 Скачать по частям</button>
+    <button id="toSwBtn">🡇 Потоковая загрузка (через SW)</button>
   </div>
   <fieldset style="margin:8px 0; padding:8px; border:1px solid #ddd; border-radius:6px;">
     <legend>Параметры</legend>
@@ -68,6 +69,7 @@
     const toFileBtn = document.getElementById('toFileBtn');
     const toBlobBtn = document.getElementById('toBlobBtn');
     const toPartsBtn = document.getElementById('toPartsBtn');
+    const toSwBtn = document.getElementById('toSwBtn');
     const partMBEl = document.getElementById('partMB');
     const cacheMBEl = document.getElementById('cacheMB');
     const prefetchEl = document.getElementById('prefetch');
@@ -239,6 +241,22 @@
       } catch (e) {
         console.warn('toParts failed', e);
         alert('Не удалось скачать по частям');
+      }
+    };
+
+    toSwBtn.onclick = async () => {
+      try {
+        if (!('serviceWorker' in navigator)) { alert('Service Worker не поддерживается'); return; }
+        // Регистрация SW у корня (public/sw.js)
+        const reg = await navigator.serviceWorker.register('./sw.js');
+        await navigator.serviceWorker.ready;
+        const id = selectEl.value; if (!id) { alert('Выберите сессию'); return; }
+        const name = `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
+        // Навигация на SW endpoint — отдаст потоковую загрузку
+        window.location.href = `./sw-download?session=${encodeURIComponent(id)}&name=${encodeURIComponent(name)}`;
+      } catch (e) {
+        console.warn('SW download failed', e);
+        alert('Не удалось запустить потоковую загрузку через SW');
       }
     };
 
