@@ -33,11 +33,11 @@ self.addEventListener('activate', (e) => { e.waitUntil(self.clients.claim()); })
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.pathname === '/sw-download') {
-    event.respondWith(handleDownload(url));
+    event.respondWith(handleDownload(url, event.clientId));
   }
 });
 
-async function handleDownload(url) {
+async function handleDownload(url, clientId) {
   const sessionId = url.searchParams.get('session');
   const filename = url.searchParams.get('name') || `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
   const mimeType = 'video/webm';
@@ -50,10 +50,14 @@ async function handleDownload(url) {
   const writable = ts.writable;
   const readable = ts.readable;
 
+  const client = clientId ? await self.clients.get(clientId) : null;
+  const send = (payload) => { try { client?.postMessage({ source: 'mb-sw', ...payload }); } catch(_) {} };
+
   (async () => {
     try {
       const db = await openDB();
       // Build sizes/prefix (index)
+      send({ type: 'sw-log', phase: 'index', message: 'start' });
       const sess = await new Promise((res, rej) => { const tx = db.transaction(SESS,'readonly'); const r = tx.objectStore(SESS).get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
       if (!sess) throw new Error('Session not found');
       const count = Number.isInteger(sess.chunkCount) ? sess.chunkCount : 0;
@@ -65,6 +69,7 @@ async function handleDownload(url) {
         const row = await new Promise((res, rej) => { const g = store.get([sessionId, i]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
         const sz = row?.blob ? row.blob.size : (row?.ab ? row.ab.byteLength : 0);
         sizes[i] = sz; total += sz;
+        if ((i & 0xFF) === 0 || i === count-1) send({ type: 'sw-log', phase: 'index', progress: (i+1)/count });
       }
       const prefix = new Array(count); let acc = 0; for (let i = 0; i < count; i++) { prefix[i] = acc; acc += sizes[i]; }
       const locate = (offset) => {
@@ -73,6 +78,7 @@ async function handleDownload(url) {
         const seq = ans; const chunkOffset = offset - prefix[seq]; return { seq, chunkOffset };
       };
       // Create random-access StreamSource
+      let served = 0;
       const source = new self.Mediabunny.StreamSource({
         getSize: () => total,
         read: async (start, end) => {
@@ -91,6 +97,7 @@ async function handleDownload(url) {
             out.set(new Uint8Array(ab), written);
             written += ab.byteLength; pos += ab.byteLength;
           }
+          served += len; if ((served & ((1<<22)-1)) === 0) send({ type: 'sw-log', phase: 'bytes', progress: served/total });
           return out;
         },
         maxCacheSize: 128 * 1024 * 1024,
@@ -100,8 +107,11 @@ async function handleDownload(url) {
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output });
+      send({ type: 'sw-log', phase: 'convert', message: 'start' });
       await conversion.execute();
+      send({ type: 'sw-log', phase: 'done', message: 'complete' });
     } catch (e) {
+      send({ type: 'sw-error', message: String(e && e.message || e) });
       try { const writer = writable.getWriter?.(); await writer?.abort?.(e); } catch(_) {}
     }
   })();

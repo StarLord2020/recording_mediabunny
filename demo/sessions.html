@@ -244,6 +244,18 @@
       }
     };
 
+    navigator.serviceWorker?.addEventListener?.('message', (ev) => {
+      const data = ev.data || {};
+      if (data.source !== 'mb-sw') return;
+      if (data.type === 'sw-log') {
+        if (data.phase === 'index' && typeof data.progress === 'number') setIndexProgress(data.progress);
+        if (data.phase === 'bytes' && typeof data.progress === 'number') setProgress(data.progress);
+      } else if (data.type === 'sw-error') {
+        console.warn('SW error:', data.message);
+        alert('SW ошибка: ' + data.message);
+      }
+    });
+
     toSwBtn.onclick = async () => {
       try {
         if (!('serviceWorker' in navigator)) { alert('Service Worker не поддерживается'); return; }
@@ -253,6 +265,8 @@
         const id = selectEl.value; if (!id) { alert('Выберите сессию'); return; }
         const name = `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
         // Навигация на SW endpoint — отдаст потоковую загрузку
+        // Сбросить прогрессы
+        setIndexProgress(0); setProgress(0); setLibProgress(0); resetFinalize();
         window.location.href = `./sw-download?session=${encodeURIComponent(id)}&name=${encodeURIComponent(name)}`;
       } catch (e) {
         console.warn('SW download failed', e);
