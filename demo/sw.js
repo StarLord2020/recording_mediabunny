@@ -51,37 +51,49 @@ async function handleDownload(url, clientId) {
   const client = clientId ? await self.clients.get(clientId) : null;
   const send = (payload) => { try { client?.postMessage({ source: 'mb-sw', ...payload }); } catch(_) {} };
 
-  // Collector sink: gather random-access writes and assemble final file with corrected headers
-  const segments = []; // { pos:number, u8:Uint8Array }
-  let maxEnd = 0;
+  // Streaming sink with reordering: emits contiguous bytes only (low RAM)
+  let rsController = null;
+  const readable = new ReadableStream({ start(c) { rsController = c; send({ type:'sw-log', phase:'stream', message:'readable started' }); } });
+  let nextOffset = 0;
+  const pending = new Map(); // position -> Uint8Array
+  const tryFlush = () => {
+    while (true) {
+      const chunk = pending.get(nextOffset);
+      if (!chunk) break;
+      pending.delete(nextOffset);
+      rsController.enqueue(chunk);
+      nextOffset += chunk.byteLength;
+    }
+  };
   const writable = new WritableStream({
     async write(chunk) {
       try {
         const position = (chunk && typeof chunk.position === 'number') ? chunk.position : undefined;
         const data = (chunk && chunk.data !== undefined) ? chunk.data : chunk;
         let u8;
-        if (data instanceof Uint8Array) {
-          u8 = data;
-        } else if (data?.buffer) {
-          u8 = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length || 0);
-        } else if (data instanceof ArrayBuffer) {
-          u8 = new Uint8Array(data);
+        if (data instanceof Uint8Array) u8 = data;
+        else if (data?.buffer) u8 = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length || 0);
+        else if (data instanceof ArrayBuffer) u8 = new Uint8Array(data);
+        else { const ab = await new Blob([data]).arrayBuffer(); u8 = new Uint8Array(ab); }
+        const pos = (position === undefined) ? nextOffset : position;
+        if (pos === nextOffset) {
+          rsController.enqueue(u8);
+          nextOffset += u8.byteLength;
+          tryFlush();
+        } else if (pos > nextOffset) {
+          pending.set(pos, u8);
         } else {
-          const ab = await new Blob([data]).arrayBuffer();
-          u8 = new Uint8Array(ab);
+          // cannot rewrite already-sent bytes in HTTP response — skip
         }
-        const pos = (position === undefined) ? maxEnd : position;
-        segments.push({ pos, u8 });
-        const end = pos + u8.byteLength;
-        if (end > maxEnd) maxEnd = end;
       } catch (err) {
         send({ type:'sw-error', phase:'sink-write', message: String(err && err.message || err) });
+        try { rsController.close(); } catch(_) {}
         throw err;
       }
     },
-    close() { send({ type:'sw-log', phase:'stream', message:'collect closed' }); },
-    abort(reason) { send({ type:'sw-error', phase:'sink-abort', message: String(reason||'') }); }
-  });
+    close() { try { tryFlush(); rsController.close(); send({ type:'sw-log', phase:'stream', message:'readable closed' }); } catch(_) {} },
+    abort(reason) { send({ type:'sw-error', phase:'sink-abort', message: String(reason||'') }); try { rsController.close(); } catch(_) {} }
+  }, { highWaterMark: 1 });
 
     // Build and execute conversion to a final Blob (corrected headers)
     try {
@@ -141,8 +153,8 @@ async function handleDownload(url, clientId) {
       });
       const input = new Input({ source, formats: [self.Mediabunny.WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 8 * 1024 * 1024 });
-      // Use non-appendOnly to allow header fix-ups; segments collector ensures final correctness
-      const output = new Output({ format: new WebMOutputFormat({ appendOnly: false }), target });
+      // Use appendOnly to avoid back-seeks so we can stream without buffering
+      const output = new Output({ format: new WebMOutputFormat({ appendOnly: true }), target });
       const forceAudio = url.searchParams.get('forceAudio') === '1';
       const forceVideo = url.searchParams.get('forceVideo') === '1';
       const convOpts = { input, output };
@@ -153,21 +165,15 @@ async function handleDownload(url, clientId) {
       send({ type: 'sw-log', phase: 'convert', message: 'start' });
       await conversion.execute();
       send({ type: 'sw-log', phase: 'done', message: 'complete' });
-
-      // Assemble final file buffer to ensure corrected headers
-      const file = new Uint8Array(maxEnd);
-      for (const { pos, u8 } of segments) { file.set(u8, pos); }
-
-      const headers = new Headers({
-        'Content-Type': mimeType,
-        'Content-Disposition': `attachment; filename="${filename}"`
-      });
-      return new Response(new Blob([file], { type: mimeType }), { status: 200, headers });
     } catch (e) {
       send({ type: 'sw-error', message: String(e && e.message || e) });
       try { const writer = writable.getWriter?.(); await writer?.abort?.(e); } catch(_) {}
-      return new Response('SW conversion error: ' + String(e && e.message || e), { status: 500 });
     }
+    const headers = new Headers({
+      'Content-Type': mimeType,
+      'Content-Disposition': `attachment; filename="${filename}"`
+    });
+    return new Response(readable, { status: 200, headers });
   } catch (err) {
     return new Response('SW init error: ' + String(err && err.message || err), { status: 500 });
   }
