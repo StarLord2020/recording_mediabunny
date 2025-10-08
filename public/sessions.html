@@ -102,7 +102,7 @@
           forceVideo: !!forceVideoEl.checked,
           padMB: Number(padMBEl.value||0),
           onIndexProgress: setIndexProgress,
-          onProgress: setProgress
+          onByteProgress: setProgress
         });
         setProgress(1);
         setTimeout(()=> setProgress(0), 800);
@@ -122,7 +122,7 @@
           forceAudio: !!forceAudioEl.checked,
           forceVideo: !!forceVideoEl.checked,
           onIndexProgress: setIndexProgress,
-          onProgress: setProgress
+          onByteProgress: setProgress
         });
         const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm` });
         document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 1500);

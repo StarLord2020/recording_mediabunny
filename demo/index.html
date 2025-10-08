@@ -323,6 +323,7 @@
         const seq = ans; const chunkOffset = offset - prefix[seq]; return { seq, chunkOffset };
       };
 
+      let servedBytes = 0;
       const source = new StreamSource({
         getSize: () => total,
         read: async (start, end) => {
@@ -342,6 +343,8 @@
             out.set(new Uint8Array(ab), written);
             written += ab.byteLength; pos += ab.byteLength;
           }
+          servedBytes += len;
+          updateProgress(Math.max(0, Math.min(1, servedBytes / total)));
           return out;
         },
         maxCacheSize: 128 * 1024 * 1024,
@@ -351,11 +354,6 @@
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output });
-      conversion.onProgress = (p) => {
-        const percent = Math.max(0, Math.min(1, p));
-        updateProgress(percent);
-        console.log(`📈 Mediabunny progress (file from IDB): ${(percent * 100).toFixed(1)}%`);
-      };
       await conversion.execute();
       try { await writable.close(); } catch (_) {}
       const elapsed = performance.now() - t0;
