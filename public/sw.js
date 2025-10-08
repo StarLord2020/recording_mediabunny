@@ -98,6 +98,11 @@ async function handleDownload(url, clientId) {
         const seq = ans; const chunkOffset = offset - prefix[seq]; return { seq, chunkOffset };
       };
       // Create random-access StreamSource
+      // Tuning via URL params
+      const cacheMB = Math.max(1, Number(url.searchParams.get('cacheMB')||64));
+      const chunkMB = Math.max(1, Number(url.searchParams.get('chunkMB')||16));
+      const prefetch = url.searchParams.get('prefetch') || 'fileSystem';
+
       let served = 0;
       const source = new self.Mediabunny.StreamSource({
         getSize: () => total,
@@ -126,11 +131,11 @@ async function handleDownload(url, clientId) {
           served += len; if ((served & ((1<<20)-1)) === 0) send({ type: 'sw-log', phase: 'bytes', progress: served/total });
           return out;
         },
-        maxCacheSize: 8 * 1024 * 1024,
-        prefetchProfile: 'none'
+        maxCacheSize: cacheMB * 1024 * 1024,
+        prefetchProfile: prefetch
       });
       const input = new Input({ source, formats: [self.Mediabunny.WEBM] });
-      const target = new StreamTarget(writable, { chunked: true, chunkSize: 4 * 1024 * 1024 });
+      const target = new StreamTarget(writable, { chunked: true, chunkSize: chunkMB * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat({ appendOnly: false }), target });
       const conversion = await Conversion.init({ input, output });
       conversion.onProgress = (p) => { try { send({ type:'sw-log', phase:'lib', progress: Math.max(0, Math.min(1, p||0)) }); } catch(_) {} };
