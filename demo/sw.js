@@ -45,30 +45,15 @@ async function handleDownload(url, clientId) {
     if (!sessionId) return new Response('Missing session', { status: 400 });
     if (!self.Mediabunny) return new Response('Mediabunny not available in SW', { status: 500 });
 
-  const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, Conversion } = self.Mediabunny;
+  const { Input, Output, WebMOutputFormat, StreamTarget, Conversion } = self.Mediabunny;
 
   // Prepare client messaging first
   const client = clientId ? await self.clients.get(clientId) : null;
   const send = (payload) => { try { client?.postMessage({ source: 'mb-sw', ...payload }); } catch(_) {} };
 
-  // Create a ReadableStream for HTTP response and a WritableStream sink for StreamTarget
-  let rsController = null;
-  const readable = new ReadableStream({ start(c) { rsController = c; send({ type:'sw-log', phase:'stream', message:'readable started' }); } });
-  // Reordering sink to respect random-access writes from StreamTarget
-  let nextOffset = 0;
-  const pending = new Map(); // position:number -> Uint8Array
-  const tryFlush = () => {
-    let loop = 0;
-    while (true) {
-      const chunk = pending.get(nextOffset);
-      if (!chunk) break;
-      pending.delete(nextOffset);
-      rsController.enqueue(chunk);
-      nextOffset += chunk.byteLength;
-      loop++;
-      if ((loop & 0xF) === 0) send({ type:'sw-log', phase:'bytes', progressHint: nextOffset });
-    }
-  };
+  // Collector sink: gather random-access writes and assemble final file with corrected headers
+  const segments = []; // { pos:number, u8:Uint8Array }
+  let maxEnd = 0;
   const writable = new WritableStream({
     async write(chunk) {
       try {
@@ -85,28 +70,20 @@ async function handleDownload(url, clientId) {
           const ab = await new Blob([data]).arrayBuffer();
           u8 = new Uint8Array(ab);
         }
-        const pos = (position === undefined) ? nextOffset : position;
-        if (pos === nextOffset) {
-          rsController.enqueue(u8);
-          nextOffset += u8.byteLength;
-          tryFlush();
-        } else if (pos > nextOffset) {
-          pending.set(pos, u8);
-        } else {
-          // duplicate/overlap — игнорируем
-          send({ type:'sw-log', phase:'sink-write', message:`duplicate pos=${pos} < next=${nextOffset}` });
-        }
+        const pos = (position === undefined) ? maxEnd : position;
+        segments.push({ pos, u8 });
+        const end = pos + u8.byteLength;
+        if (end > maxEnd) maxEnd = end;
       } catch (err) {
         send({ type:'sw-error', phase:'sink-write', message: String(err && err.message || err) });
-        try { rsController.close(); } catch(_) {}
         throw err;
       }
     },
-    close() { try { tryFlush(); rsController.close(); send({ type:'sw-log', phase:'stream', message:'readable closed' }); } catch(_) {} },
-    abort(reason) { send({ type:'sw-error', phase:'sink-abort', message: String(reason||'') }); try { rsController.close(); } catch(_) {} }
-  }, { highWaterMark: 1 });
+    close() { send({ type:'sw-log', phase:'stream', message:'collect closed' }); },
+    abort(reason) { send({ type:'sw-error', phase:'sink-abort', message: String(reason||'') }); }
+  });
 
-  (async () => {
+    // Build and execute conversion to a final Blob (corrected headers)
     try {
       const db = await openDB();
       // Build sizes/prefix (index)
@@ -164,23 +141,33 @@ async function handleDownload(url, clientId) {
       });
       const input = new Input({ source, formats: [self.Mediabunny.WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 8 * 1024 * 1024 });
-      const output = new Output({ format: new WebMOutputFormat({ appendOnly: true }), target });
-      const conversion = await Conversion.init({ input, output });
+      // Use non-appendOnly to allow header fix-ups; segments collector ensures final correctness
+      const output = new Output({ format: new WebMOutputFormat({ appendOnly: false }), target });
+      const forceAudio = url.searchParams.get('forceAudio') === '1';
+      const forceVideo = url.searchParams.get('forceVideo') === '1';
+      const convOpts = { input, output };
+      if (forceAudio) convOpts.audio = { forceTranscode: true };
+      if (forceVideo) convOpts.video = { forceTranscode: true };
+      const conversion = await Conversion.init(convOpts);
       conversion.onProgress = (p) => { try { send({ type:'sw-log', phase:'lib', progress: Math.max(0, Math.min(1, p||0)) }); } catch(_) {} };
       send({ type: 'sw-log', phase: 'convert', message: 'start' });
       await conversion.execute();
       send({ type: 'sw-log', phase: 'done', message: 'complete' });
+
+      // Assemble final file buffer to ensure corrected headers
+      const file = new Uint8Array(maxEnd);
+      for (const { pos, u8 } of segments) { file.set(u8, pos); }
+
+      const headers = new Headers({
+        'Content-Type': mimeType,
+        'Content-Disposition': `attachment; filename="${filename}"`
+      });
+      return new Response(new Blob([file], { type: mimeType }), { status: 200, headers });
     } catch (e) {
       send({ type: 'sw-error', message: String(e && e.message || e) });
       try { const writer = writable.getWriter?.(); await writer?.abort?.(e); } catch(_) {}
+      return new Response('SW conversion error: ' + String(e && e.message || e), { status: 500 });
     }
-  })();
-
-    const headers = new Headers({
-      'Content-Type': mimeType,
-      'Content-Disposition': `attachment; filename="${filename}"`
-    });
-    return new Response(readable, { status: 200, headers });
   } catch (err) {
     return new Response('SW init error: ' + String(err && err.message || err), { status: 500 });
   }
