@@ -48,6 +48,13 @@
         <div class="progress" style="width:520px"><div class="progress__bar" id="progressLibBar"></div></div>
         <div id="progressLibText">Прогресс библиотеки 0%</div>
       </div>
+      <div>
+        <div class="progress" style="width:520px"><div class="progress__bar" id="progressFinalBar"></div></div>
+        <div id="progressFinalText">Финализация 0%</div>
+      </div>
+    </div>
+    <div class="row">
+      <div id="totalTimeText">Итого: 0.0 с</div>
     </div>
   </fieldset>
 
@@ -67,6 +74,9 @@
     const progressText = document.getElementById('progressText');
     const progressLibBar = document.getElementById('progressLibBar');
     const progressLibText = document.getElementById('progressLibText');
+    const progressFinalBar = document.getElementById('progressFinalBar');
+    const progressFinalText = document.getElementById('progressFinalText');
+    const totalTimeText = document.getElementById('totalTimeText');
     const progressIndexBar = document.getElementById('progressIndexBar');
     const progressIndexText = document.getElementById('progressIndexText');
 
@@ -84,6 +94,23 @@
       const v = Math.max(0, Math.min(1, p||0));
       progressLibBar.style.width = `${(v*100).toFixed(1)}%`;
       progressLibText.textContent = `Прогресс библиотеки ${(v*100).toFixed(1)}%`;
+    }
+    let finalizeTimer = null;
+    function startFinalize() {
+      if (finalizeTimer) return;
+      progressFinalBar.style.width = '5%';
+      progressFinalText.textContent = 'Финализация…';
+      let w = 5;
+      finalizeTimer = setInterval(() => {
+        w += 3; if (w > 95) w = 10; // имитация движения
+        progressFinalBar.style.width = `${w}%`;
+      }, 150);
+    }
+    function endFinalize() {
+      if (finalizeTimer) { clearInterval(finalizeTimer); finalizeTimer = null; }
+      progressFinalBar.style.width = '100%';
+      progressFinalText.textContent = 'Финализация 100%';
+      setTimeout(() => { progressFinalBar.style.width = '0%'; progressFinalText.textContent = 'Финализация 0%'; }, 800);
     }
 
     async function loadSessions() {
@@ -105,7 +132,8 @@
         const id = selectEl.value; if (!id) { alert('Выберите сессию'); return; }
         if (!window.showSaveFilePicker) { alert('Нужен File System Access API'); return; }
         const handle = await window.showSaveFilePicker({ suggestedName: `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types: [{ description:'WebM', accept: {'video/webm':['.webm']}}] });
-        setProgress(0);
+        setProgress(0); setLibProgress(0); setIndexProgress(0); endFinalize();
+        const t0 = performance.now();
         await remuxSessionToFile(id, handle, {
           cacheMB: Number(cacheMBEl.value||0),
           prefetch: prefetchEl.value,
@@ -116,12 +144,14 @@
           // Для быстрого старта прогресса используем byte-based прогресс
           onByteProgress: setProgress,
           // Прогресс от библиотеки Mediabunny
-          onProgress: setLibProgress
+          onProgress: (p) => { setLibProgress(p); if (p >= 1) startFinalize(); }
         });
         setProgress(1);
         setTimeout(()=> setProgress(0), 800);
         setIndexProgress(0);
-        setLibProgress(0);
+        endFinalize();
+        const t1 = performance.now();
+        totalTimeText.textContent = `Итого: ${((t1 - t0)/1000).toFixed(1)} с`;
       } catch (e) {
         console.warn('toFile failed', e);
         alert('Не удалось записать файл');
@@ -130,7 +160,8 @@
     toBlobBtn.onclick = async () => {
       try {
         const id = selectEl.value; if (!id) { alert('Выберите сессию'); return; }
-        setProgress(0);
+        setProgress(0); setLibProgress(0); setIndexProgress(0); endFinalize();
+        const t0 = performance.now();
         const blob = await remuxSessionToBlob(id, {
           cacheMB: Number(cacheMBEl.value||0),
           prefetch: prefetchEl.value,
@@ -138,14 +169,16 @@
           forceVideo: !!forceVideoEl.checked,
           onIndexProgress: setIndexProgress,
           onByteProgress: setProgress,
-          onProgress: setLibProgress
+          onProgress: (p) => { setLibProgress(p); if (p >= 1) startFinalize(); }
         });
         const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm` });
         document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
         setProgress(1);
         setTimeout(()=> setProgress(0), 800);
         setIndexProgress(0);
-        setLibProgress(0);
+        endFinalize();
+        const t1 = performance.now();
+        totalTimeText.textContent = `Итого: ${((t1 - t0)/1000).toFixed(1)} с`;
       } catch (e) {
         console.warn('toBlob failed', e);
         alert('Не удалось собрать в Blob');
