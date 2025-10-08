@@ -53,21 +53,50 @@ async function handleDownload(url) {
   (async () => {
     try {
       const db = await openDB();
-      let nextSeq = 0; let done = false;
-      const stream = new ReadableStream({
-        async pull(controller) {
-          if (done) { controller.close(); return; }
-          const tx = db.transaction(CHUNKS,'readonly');
-          const store = tx.objectStore(CHUNKS);
-          const row = await new Promise((res, rej) => { const g = store.get([sessionId, nextSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
-          if (!row) { done = true; controller.close(); return; }
-          const blob = row.blob || new Blob([row.ab], { type: mimeType });
-          const ab = await blob.arrayBuffer();
-          controller.enqueue(new Uint8Array(ab));
-          nextSeq = (row.seq || nextSeq) + 1;
-        }
+      // Build sizes/prefix (index)
+      const sess = await new Promise((res, rej) => { const tx = db.transaction(SESS,'readonly'); const r = tx.objectStore(SESS).get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+      if (!sess) throw new Error('Session not found');
+      const count = Number.isInteger(sess.chunkCount) ? sess.chunkCount : 0;
+      if (count <= 0) throw new Error('No chunks');
+      const sizes = new Array(count); let total = 0;
+      for (let i = 0; i < count; i++) {
+        const tx = db.transaction(CHUNKS,'readonly'); const store = tx.objectStore(CHUNKS);
+        // eslint-disable-next-line no-await-in-loop
+        const row = await new Promise((res, rej) => { const g = store.get([sessionId, i]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+        const sz = row?.blob ? row.blob.size : (row?.ab ? row.ab.byteLength : 0);
+        sizes[i] = sz; total += sz;
+      }
+      const prefix = new Array(count); let acc = 0; for (let i = 0; i < count; i++) { prefix[i] = acc; acc += sizes[i]; }
+      const locate = (offset) => {
+        let lo = 0, hi = count - 1, ans = 0;
+        while (lo <= hi) { const mid = (lo + hi) >> 1; if (prefix[mid] <= offset) { ans = mid; lo = mid + 1; } else { hi = mid - 1; } }
+        const seq = ans; const chunkOffset = offset - prefix[seq]; return { seq, chunkOffset };
+      };
+      // Create random-access StreamSource
+      const source = new self.Mediabunny.StreamSource({
+        getSize: () => total,
+        read: async (start, end) => {
+          const len = end - start; const out = new Uint8Array(len);
+          let written = 0; let pos = start;
+          while (written < len) {
+            const { seq, chunkOffset } = locate(pos);
+            const tx = db.transaction(CHUNKS,'readonly'); const store = tx.objectStore(CHUNKS);
+            // eslint-disable-next-line no-await-in-loop
+            const row = await new Promise((res, rej) => { const g = store.get([sessionId, seq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+            if (!row) throw new Error('Missing chunk');
+            const blob = row.blob || new Blob([row.ab], { type: mimeType });
+            const take = Math.min(blob.size - chunkOffset, len - written);
+            // eslint-disable-next-line no-await-in-loop
+            const ab = await blob.slice(chunkOffset, chunkOffset + take).arrayBuffer();
+            out.set(new Uint8Array(ab), written);
+            written += ab.byteLength; pos += ab.byteLength;
+          }
+          return out;
+        },
+        maxCacheSize: 128 * 1024 * 1024,
+        prefetchProfile: 'fileSystem'
       });
-      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [self.Mediabunny.WEBM] });
+      const input = new Input({ source, formats: [self.Mediabunny.WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
       const output = new Output({ format: new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output });
@@ -83,4 +112,3 @@ async function handleDownload(url) {
   });
   return new Response(readable, { status: 200, headers });
 }
-
