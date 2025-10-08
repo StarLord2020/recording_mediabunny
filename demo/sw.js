@@ -124,14 +124,14 @@ async function handleDownload(url, clientId) {
             }
             written += (ab?.byteLength || 0); pos += (ab?.byteLength || 0);
           }
-          served += len; if ((served & ((1<<22)-1)) === 0) send({ type: 'sw-log', phase: 'bytes', progress: served/total });
+          served += len; if ((served & ((1<<20)-1)) === 0) send({ type: 'sw-log', phase: 'bytes', progress: served/total });
           return out;
         },
-        maxCacheSize: 128 * 1024 * 1024,
-        prefetchProfile: 'fileSystem'
+        maxCacheSize: 8 * 1024 * 1024,
+        prefetchProfile: 'none'
       });
       const input = new Input({ source, formats: [self.Mediabunny.WEBM] });
-      const target = new StreamTarget(writable, { chunked: true, chunkSize: 8 * 1024 * 1024 });
+      const target = new StreamTarget(writable, { chunked: true, chunkSize: 4 * 1024 * 1024 });
       // Allow library to fix headers via random-access writes (still low RAM thanks to OPFS)
       const output = new Output({ format: new WebMOutputFormat({ appendOnly: false }), target });
       const forceAudio = url.searchParams.get('forceAudio') === '1';
