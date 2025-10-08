@@ -139,7 +139,8 @@ async function assembleAndDownload(sessionId, fileName) {
 
   const parts = rows.map((r) => r.blob || new Blob([r.ab], { type: sess.mimeType }));
   const blob = new Blob(parts, { type: sess.mimeType });
-  const name = fileName || `${sess.filenameBase || 'recording'}.${sess.mimeType?.startsWith('video/webm') ? 'webm' : 'webm'}`;
+  const isMp4 = (sess.mimeType || '').startsWith('video/mp4');
+  const name = fileName || `${sess.filenameBase || 'recording'}.${isMp4 ? 'mp4' : 'webm'}`;
   const url = URL.createObjectURL(blob);
   const a = Object.assign(document.createElement('a'), { href: url, download: name });
   document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);

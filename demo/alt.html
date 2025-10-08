@@ -38,6 +38,16 @@
   <video id="preview" autoplay muted></video><br>
   <button id="startBtn">▶️ Начать запись экрана</button>
   <button id="stopBtn" disabled>⏹️ Остановить</button>
+  <label style="margin-left:10px; font: 13px system-ui, sans-serif;">
+    Кодек:
+    <select id="codecSelect">
+      <option value="auto" selected>Авто (лучший доступный)</option>
+      <option value="video/webm; codecs=vp9,opus">WebM: VP9 + Opus</option>
+      <option value="video/webm; codecs=vp8,opus">WebM: VP8 + Opus</option>
+      <option value="video/webm">WebM (по умолчанию)</option>
+      <option value="video/mp4">MP4 (H.264/AAC)</option>
+    </select>
+  </label>
 
   <div id="recInfo" style="display:none; margin: 0 10px; color:#0d47a1;">
     <span style="display:inline-block; width:10px; height:10px; background:#1e88e5; border-radius:50%; margin-right:6px; vertical-align:middle;"></span>
@@ -98,6 +108,7 @@
     const btnSSFile = document.getElementById('btnSSFile');
     const btnSSBlob = document.getElementById('btnSSBlob');
     const btnRSFile = document.getElementById('btnRSFile');
+    const codecSelect = document.getElementById('codecSelect');
 
     let recorder; let recTimerId = null; let recStartMs = 0; let fsWritable = null; let fsHandle = null; let idbWriter = null; let currentSessionId = null;
     let firstChunkBlob = null; // для генерации большого входа
@@ -114,11 +125,44 @@
       document.getElementById('recTime').textContent = `${m}:${s}`;
     }
 
+    function updateCodecOptionsSupport() {
+      if (!window.MediaRecorder) return;
+      const opts = Array.from(codecSelect.options).filter(o => o.value !== 'auto');
+      for (const o of opts) {
+        try {
+          const sup = MediaRecorder.isTypeSupported(o.value);
+          o.disabled = !sup;
+          o.textContent = o.textContent.replace(/ \(не поддерживается\)$/,'') + (sup ? '' : ' (не поддерживается)');
+        } catch (_) {
+          o.disabled = true;
+          o.textContent = o.textContent.replace(/ \(не поддерживается\)$/,'') + ' (не поддерживается)';
+        }
+      }
+    }
+    function resolveMimeSelection() {
+      const selected = codecSelect.value;
+      const candidates = [
+        'video/webm; codecs=vp9,opus',
+        'video/webm; codecs=vp8,opus',
+        'video/webm',
+        'video/mp4'
+      ];
+      const tryList = selected === 'auto' ? candidates : [selected, ...candidates.filter(x => x !== selected)];
+      for (const mt of tryList) { if (MediaRecorder.isTypeSupported(mt)) return mt; }
+      return '';
+    }
+
     async function startRecording() {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       preview.srcObject = stream;
-      recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs=vp9,opus' });
-      try { idbWriter = new IDBWriter(); idbRequestPersistence?.(); currentSessionId = await idbWriter.start({ filenameBase: 'screen-recording', mimeType: 'video/webm', roomId: undefined }); } catch (_) { idbWriter = null; currentSessionId = null; }
+      updateCodecOptionsSupport();
+      const chosenMime = resolveMimeSelection();
+      recorder = chosenMime ? new MediaRecorder(stream, { mimeType: chosenMime }) : new MediaRecorder(stream);
+      try {
+        idbWriter = new IDBWriter(); idbRequestPersistence?.();
+        const sessMime = recorder.mimeType || chosenMime || 'video/webm';
+        currentSessionId = await idbWriter.start({ filenameBase: 'screen-recording', mimeType: sessMime, roomId: undefined });
+      } catch (_) { idbWriter = null; currentSessionId = null; }
       recorder.ondataavailable = e => {
         if (e.data && e.data.size > 0) {
           if (!firstChunkBlob) firstChunkBlob = e.data;
@@ -137,18 +181,20 @@
               return;
             }
             if (!fsHandle) {
+              const mime = recorder?.mimeType || 'video/webm';
+              const isMp4 = /^video\/mp4/.test(mime);
               fsHandle = await window.showSaveFilePicker({
-                suggestedName: `debug-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`,
-                types: [{ description: 'WebM Video', accept: { 'video/webm': ['.webm'] } }]
+                suggestedName: `debug-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.${isMp4 ? 'mp4' : 'webm'}`,
+                types: [ isMp4 ? { description: 'MP4 Video', accept: { 'video/mp4': ['.mp4'] } } : { description: 'WebM Video', accept: { 'video/webm': ['.webm'] } } ]
               });
             }
-            await remuxOnceToFileAndPad(currentSessionId, 'video/webm', fsHandle, debugMB);
+            await remuxOnceToFileAndPad(currentSessionId, recorder?.mimeType || 'video/webm', fsHandle, debugMB);
           } catch (e) {
             console.warn('Debug remux to file failed:', e);
             alert('Не удалось записать в файл в режиме отладки.');
           }
         } else if (fsWritable && currentSessionId) {
-          try { await remuxToFileFromIDB(currentSessionId, 'video/webm', t0, fsWritable); }
+          try { await remuxToFileFromIDB(currentSessionId, recorder?.mimeType || 'video/webm', t0, fsWritable); }
           catch (e) {
             console.warn('Stream-to-file failed on alt page:', e);
             try { await fsWritable.close(); } catch (_) {}
@@ -194,23 +240,26 @@
     }
     function handleReadyBlob(fixedBlob, elapsedMs) {
       const url = URL.createObjectURL(fixedBlob);
-      const a = Object.assign(document.createElement('a'), { href: url, download: `screen-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm` });
+      const isMp4 = /^video\/mp4/.test(fixedBlob.type);
+      const a = Object.assign(document.createElement('a'), { href: url, download: `screen-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.${isMp4 ? 'mp4' : 'webm'}` });
       document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
       updateProgress(1); setTimeout(() => { progressEl.style.display = 'none'; progressTextEl.style.display = 'none'; updateProgress(0); }, 600);
     }
     async function fallbackFromIDB() {
-      const fullBlob = await buildBlobFromIDB(currentSessionId);
+      const mt = recorder?.mimeType || 'video/webm';
+      const fullBlob = await buildBlobFromIDB(currentSessionId, mt);
       const fixedBlob = await rebuildBlobWebM(fullBlob);
       handleReadyBlob(fixedBlob, 0);
     }
-    async function buildBlobFromIDB(sessionId) {
+    async function buildBlobFromIDB(sessionId, mimeType) {
       const db = await idbOpenDB();
       const rows = await new Promise((res, rej) => { const tx = db.transaction('chunks','readonly'); const idx = tx.objectStore('chunks').index('bySession'); const req = idx.getAll(IDBKeyRange.only(sessionId)); req.onsuccess = () => res(req.result.sort((a,b)=>a.seq-b.seq)); req.onerror = () => rej(req.error); });
-      const parts = rows.map((r) => r.blob || new Blob([r.ab], { type: 'video/webm' }));
-      return new Blob(parts, { type: 'video/webm' });
+      const mt = mimeType || 'video/webm';
+      const parts = rows.map((r) => r.blob || new Blob([r.ab], { type: mt }));
+      return new Blob(parts, { type: mt });
     }
     async function remuxToFileFromIDB(sessionId, mimeType, t0, writable) {
-      const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, WEBM, Conversion } = window.Mediabunny;
+      const { Input, Output, WebMOutputFormat, Mp4OutputFormat, StreamTarget, ReadableStreamSource, WEBM, MP4, Conversion } = window.Mediabunny;
       try { await writable.truncate?.(0); } catch(_) {}
       const db = await idbOpenDB();
       const sess = await new Promise((res, rej) => { const tx = db.transaction('sessions','readonly'); const r = tx.objectStore('sessions').get(sessionId); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
@@ -234,9 +283,10 @@
           } catch (e) { controller.error(e); }
         }
       });
-      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [WEBM] });
+      const isMp4 = /^video\/mp4/.test(mimeType);
+      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: 64 * 1024 * 1024 }), formats: [isMp4 ? MP4 : WEBM] });
       const target = new StreamTarget(writable, { chunked: true, chunkSize: 16 * 1024 * 1024 });
-      const output = new Output({ format: new WebMOutputFormat(), target });
+      const output = new Output({ format: isMp4 ? new Mp4OutputFormat() : new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output, audio: { forceTranscode: true } });
       conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
       await conversion.execute();
@@ -392,7 +442,7 @@
     }
 
     async function remuxDebugFromIDBToBlob(sessionId, sizeMB, mimeType) {
-      const { Input, Output, WebMOutputFormat, BufferTarget, StreamSource, WEBM, Conversion } = window.Mediabunny;
+      const { Input, Output, WebMOutputFormat, Mp4OutputFormat, BufferTarget, StreamSource, WEBM, MP4, Conversion } = window.Mediabunny;
       const targetBytes = Math.max(0, Math.floor(sizeMB * 1024 * 1024));
       if (targetBytes === 0) throw new Error('Target size must be > 0');
       const index = await buildSessionIndex(sessionId, mimeType);
@@ -423,24 +473,29 @@
         maxCacheSize: 128 * 1024 * 1024,
         prefetchProfile: 'fileSystem'
       });
-      const input = new Input({ source, formats: [WEBM] });
+      const isMp4 = /^video\/mp4/.test(mimeType);
+      const input = new Input({ source, formats: [isMp4 ? MP4 : WEBM] });
       const target = new BufferTarget();
-      const output = new Output({ format: new WebMOutputFormat(), target });
+      const output = new Output({ format: isMp4 ? new Mp4OutputFormat() : new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output });
       conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
       await conversion.execute();
-      return new Blob([target.buffer], { type: 'video/webm' });
+      return new Blob([target.buffer], { type: isMp4 ? 'video/mp4' : 'video/webm' });
     }
     async function rebuildBlobWebM(blob) {
-      const { Input, Output, WebMOutputFormat, BufferTarget, BlobSource, WEBM, Conversion } = window.Mediabunny;
-      const input = new Input({ source: new BlobSource(blob), formats: [WEBM] });
+      const { Input, Output, WebMOutputFormat, Mp4OutputFormat, BufferTarget, BlobSource, WEBM, MP4, Conversion } = window.Mediabunny;
+      const isMp4 = /^video\/mp4/.test(blob.type);
+      const input = new Input({ source: new BlobSource(blob), formats: [isMp4 ? MP4 : WEBM] });
       const target = new BufferTarget();
-      const output = new Output({ format: new WebMOutputFormat(), target });
+      const output = new Output({ format: isMp4 ? new Mp4OutputFormat() : new WebMOutputFormat(), target });
       const conversion = await Conversion.init({ input, output });
       conversion.onProgress = (p) => { updateProgress(Math.max(0, Math.min(1, p || 0))); };
       await conversion.execute();
-      return new Blob([target.buffer], { type: 'video/webm' });
+      return new Blob([target.buffer], { type: isMp4 ? 'video/mp4' : 'video/webm' });
     }
+
+    // Обновить список поддерживаемых кодеков
+    updateCodecOptionsSupport();
 
     startBtn.onclick = startRecording; stopBtn.onclick = stopRecording;
     procLastBtn.onclick = async () => {
@@ -452,8 +507,12 @@
         sessions.sort((a,b)=> (b.startedAt||0) - (a.startedAt||0));
         const s = sessions[0];
         if (!window.showSaveFilePicker) { alert('Нужен File System Access API'); return; }
-        fsHandle = await window.showSaveFilePicker({ suggestedName: `debug-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types:[{description:'WebM', accept: {'video/webm':['.webm']}}]});
-        await remuxOnceToFileAndPad(s.id, s.mimeType || 'video/webm', fsHandle, debugMB);
+        {
+          const mt = s.mimeType || 'video/webm';
+          const isMp4 = /^video\/mp4/.test(mt);
+          fsHandle = await window.showSaveFilePicker({ suggestedName: `debug-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.${isMp4?'mp4':'webm'}`, types:[ isMp4 ? {description:'MP4', accept:{'video/mp4':['.mp4']}} : {description:'WebM', accept:{'video/webm':['.webm']}} ]});
+          await remuxOnceToFileAndPad(s.id, mt, fsHandle, debugMB);
+        }
         alert('Готово: файл записан');
       } catch (e) { console.warn('procLast failed', e); alert('Не удалось собрать последнюю сессию'); }
     };
@@ -465,8 +524,11 @@
         if (!sel) { alert('Выберите сессию'); return; }
         const mime = sessionSelect.options[sessionSelect.selectedIndex]?.dataset?.mime || 'video/webm';
         if (!window.showSaveFilePicker) { alert('Нужен File System Access API'); return; }
-        fsHandle = await window.showSaveFilePicker({ suggestedName: `debug-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types:[{description:'WebM', accept: {'video/webm':['.webm']}}]});
-        await remuxOnceToFileAndPad(sel, mime, fsHandle, debugMB);
+        {
+          const isMp4 = /^video\/mp4/.test(mime);
+          fsHandle = await window.showSaveFilePicker({ suggestedName: `debug-recording-${new Date().toISOString().replace(/[:.]/g,'-')}.${isMp4?'mp4':'webm'}`, types:[ isMp4 ? {description:'MP4', accept:{'video/mp4':['.mp4']}} : {description:'WebM', accept:{'video/webm':['.webm']}} ]});
+          await remuxOnceToFileAndPad(sel, mime, fsHandle, debugMB);
+        }
         alert('Готово: файл записан');
       } catch (e) { console.warn('procSelected failed', e); alert('Не удалось собрать выбранную сессию'); }
     };
@@ -483,7 +545,8 @@
       const forceAudio = !!optAudioTrans.checked;
       const forceVideo = !!optVideoTrans.checked;
       const padMB = Math.max(0, Number(optPadMB.value||0));
-      const handle = await window.showSaveFilePicker({ suggestedName: `debug-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types: [{ description:'WebM', accept: {'video/webm':['.webm']}}] });
+      const isMp4 = /^video\/mp4/.test(mime);
+      const handle = await window.showSaveFilePicker({ suggestedName: `debug-${new Date().toISOString().replace(/[:.]/g,'-')}.${isMp4?'mp4':'webm'}`, types: [ isMp4 ? { description:'MP4', accept: {'video/mp4':['.mp4']}} : { description:'WebM', accept: {'video/webm':['.webm']}} ] });
       await remuxSelected_StreamSource_toFile({ sessionId: sel, mimeType: mime, handle, cacheMB, prefetch, forceAudio, forceVideo, padMB });
       alert('Готово: файл записан');
     };
@@ -506,7 +569,8 @@
       const forceAudio = !!optAudioTrans.checked;
       const forceVideo = !!optVideoTrans.checked;
       const padMB = Math.max(0, Number(optPadMB.value||0));
-      const handle = await window.showSaveFilePicker({ suggestedName: `debug-rs-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types: [{ description:'WebM', accept: {'video/webm':['.webm']}}] });
+      const isMp4_2 = /^video\/mp4/.test(mime);
+      const handle = await window.showSaveFilePicker({ suggestedName: `debug-rs-${new Date().toISOString().replace(/[:.]/g,'-')}.${isMp4_2?'mp4':'webm'}`, types: [ isMp4_2 ? { description:'MP4', accept: {'video/mp4':['.mp4']}} : { description:'WebM', accept: {'video/webm':['.webm']}} ] });
       await remuxSelected_ReadableStreamSource_toFile({ sessionId: sel, mimeType: mime, handle, cacheMB, forceAudio, forceVideo, padMB });
       alert('Готово: файл записан');
     };
@@ -514,7 +578,7 @@
     // Implementations
     async function remuxSelected_StreamSource_toFile(opts) {
       const { sessionId, mimeType, handle, cacheMB, prefetch, forceAudio, forceVideo, padMB } = opts;
-      const { Input, Output, WebMOutputFormat, StreamTarget, StreamSource, Conversion } = window.Mediabunny;
+      const { Input, Output, WebMOutputFormat, Mp4OutputFormat, StreamTarget, StreamSource, WEBM, MP4, Conversion } = window.Mediabunny;
       const writable = await handle.createWritable({ keepExistingData: false });
       try { await writable.truncate(0); } catch(_) {}
       const { db, count, sizes, prefix, totalSize } = await buildSessionIndex(sessionId, mimeType);
@@ -539,9 +603,8 @@
         maxCacheSize: Math.max(0, (cacheMB|0)) * 1024 * 1024,
         prefetchProfile: prefetch || 'none'
       });
-      const input = new Input({ source, formats: [WebM] ?? [window.Mediabunny.WEBM] });
-      // Correct formats arg: use window.Mediabunny.WEBM
-      const input2 = new Input({ source, formats: [window.Mediabunny.WEBM] });
+      const isMp4 = /^video\/mp4/.test(mimeType);
+      const input2 = new Input({ source, formats: [isMp4 ? MP4 : WEBM] });
       // Wrap file stream into WritableStream for StreamTarget
       const sink = new WritableStream({
         async write(chunk) {
@@ -558,7 +621,7 @@
         async close() {}, async abort() {}
       }, { highWaterMark: 1 });
       const target = new StreamTarget(sink, { chunked: true, chunkSize: 16 * 1024 * 1024 });
-      const output = new Output({ format: new WebMOutputFormat(), target });
+      const output = new Output({ format: isMp4 ? new Mp4OutputFormat() : new WebMOutputFormat(), target });
       const convOpts = { input: input2, output };
       if (forceAudio) convOpts.audio = { forceTranscode: true };
       if (forceVideo) convOpts.video = { forceTranscode: true };
@@ -577,7 +640,7 @@
 
     async function remuxSelected_StreamSource_toBlob(opts) {
       const { sessionId, mimeType, cacheMB, prefetch, forceAudio, forceVideo } = opts;
-      const { Input, Output, WebMOutputFormat, BufferTarget, StreamSource, Conversion } = window.Mediabunny;
+      const { Input, Output, WebMOutputFormat, Mp4OutputFormat, BufferTarget, StreamSource, WEBM, MP4, Conversion } = window.Mediabunny;
       const { db, count, sizes, prefix, totalSize } = await buildSessionIndex(sessionId, mimeType);
       const source = new StreamSource({
         getSize: () => totalSize,
@@ -600,9 +663,10 @@
         maxCacheSize: Math.max(0, (cacheMB|0)) * 1024 * 1024,
         prefetchProfile: prefetch || 'none'
       });
-      const input = new Input({ source, formats: [window.Mediabunny.WEBM] });
+      const isMp4 = /^video\/mp4/.test(mimeType);
+      const input = new Input({ source, formats: [isMp4 ? MP4 : WEBM] });
       const target = new BufferTarget();
-      const output = new Output({ format: new WebMOutputFormat(), target });
+      const output = new Output({ format: isMp4 ? new Mp4OutputFormat() : new WebMOutputFormat(), target });
       const convOpts = { input, output };
       if (forceAudio) convOpts.audio = { forceTranscode: true };
       if (forceVideo) convOpts.video = { forceTranscode: true };
@@ -610,13 +674,14 @@
       conversion.onProgress = (p) => updateProgress(Math.max(0, Math.min(1, p || 0)));
       await conversion.execute();
       const blob = new Blob([target.buffer], { type: mimeType });
-      const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `debug-${new Date().toISOString().replace(/[:.]/g,'-')}.webm` });
+      const isMp4_3 = /^video\/mp4/.test(mimeType);
+      const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `debug-${new Date().toISOString().replace(/[:.]/g,'-')}.${isMp4_3?'mp4':'webm'}` });
       document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
     }
 
     async function remuxSelected_ReadableStreamSource_toFile(opts) {
       const { sessionId, mimeType, handle, cacheMB, forceAudio, forceVideo, padMB } = opts;
-      const { Input, Output, WebMOutputFormat, StreamTarget, ReadableStreamSource, Conversion } = window.Mediabunny;
+      const { Input, Output, WebMOutputFormat, Mp4OutputFormat, StreamTarget, ReadableStreamSource, WEBM, MP4, Conversion } = window.Mediabunny;
       const writable = await handle.createWritable({ keepExistingData: false });
       try { await writable.truncate(0); } catch(_) {}
       const db = await idbOpenDB();
@@ -632,7 +697,8 @@
           nextSeq = (row.seq || nextSeq) + 1;
         }
       });
-      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: Math.max(0,(cacheMB|0))*1024*1024 }), formats: [window.Mediabunny.WEBM] });
+      const isMp4_4 = /^video\/mp4/.test(mimeType);
+      const input = new Input({ source: new ReadableStreamSource(stream, { maxCacheSize: Math.max(0,(cacheMB|0))*1024*1024 }), formats: [isMp4_4 ? MP4 : WEBM] });
       const sink = new WritableStream({
         async write(chunk) {
           const data = chunk && chunk.data !== undefined ? chunk.data : chunk;
@@ -645,7 +711,7 @@
         }, async close() {}, async abort() {}
       }, { highWaterMark: 1 });
       const target = new StreamTarget(sink, { chunked: true, chunkSize: 16 * 1024 * 1024 });
-      const output = new Output({ format: new WebMOutputFormat(), target });
+      const output = new Output({ format: isMp4_4 ? new Mp4OutputFormat() : new WebMOutputFormat(), target });
       const convOpts = { input, output };
       if (forceAudio) convOpts.audio = { forceTranscode: true };
       if (forceVideo) convOpts.video = { forceTranscode: true };
