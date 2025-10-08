@@ -48,26 +48,32 @@ async function handleDownload(url, clientId) {
 
   // Create a ReadableStream for HTTP response and a WritableStream sink for StreamTarget
   let rsController = null;
-  const readable = new ReadableStream({ start(c) { rsController = c; } });
+  const readable = new ReadableStream({ start(c) { rsController = c; send({ type:'sw-log', phase:'stream', message:'readable started' }); } });
   const writable = new WritableStream({
     async write(chunk) {
       // StreamTarget may pass { type:'write', data: Uint8Array, position?: number } or raw Uint8Array
-      const data = (chunk && chunk.data !== undefined) ? chunk.data : chunk;
-      let u8;
-      if (data instanceof Uint8Array) {
-        u8 = data;
-      } else if (data?.buffer) {
-        u8 = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length || 0);
-      } else if (data instanceof ArrayBuffer) {
-        u8 = new Uint8Array(data);
-      } else {
-        const ab = await new Blob([data]).arrayBuffer();
-        u8 = new Uint8Array(ab);
+      try {
+        const data = (chunk && chunk.data !== undefined) ? chunk.data : chunk;
+        let u8;
+        if (data instanceof Uint8Array) {
+          u8 = data;
+        } else if (data?.buffer) {
+          u8 = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length || 0);
+        } else if (data instanceof ArrayBuffer) {
+          u8 = new Uint8Array(data);
+        } else {
+          const ab = await new Blob([data]).arrayBuffer();
+          u8 = new Uint8Array(ab);
+        }
+        rsController.enqueue(u8);
+      } catch (err) {
+        send({ type:'sw-error', phase:'sink-write', message: String(err && err.message || err) });
+        try { rsController.close(); } catch(_) {}
+        throw err;
       }
-      rsController.enqueue(u8);
     },
-    close() { try { rsController.close(); } catch(_) {} },
-    abort() { try { rsController.close(); } catch(_) {} }
+    close() { try { rsController.close(); send({ type:'sw-log', phase:'stream', message:'readable closed' }); } catch(_) {} },
+    abort(reason) { send({ type:'sw-error', phase:'sink-abort', message: String(reason||'') }); try { rsController.close(); } catch(_) {} }
   }, { highWaterMark: 1 });
 
   const client = clientId ? await self.clients.get(clientId) : null;
@@ -112,9 +118,14 @@ async function handleDownload(url, clientId) {
             if (!row) throw new Error('Missing chunk');
             const blob = row.blob || new Blob([row.ab], { type: mimeType });
             const take = Math.min(blob.size - chunkOffset, len - written);
-            // eslint-disable-next-line no-await-in-loop
-            const ab = await blob.slice(chunkOffset, chunkOffset + take).arrayBuffer();
-            out.set(new Uint8Array(ab), written);
+            try {
+              // eslint-disable-next-line no-await-in-loop
+              const ab = await blob.slice(chunkOffset, chunkOffset + take).arrayBuffer();
+              out.set(new Uint8Array(ab), written);
+            } catch (err) {
+              send({ type:'sw-error', phase:'read-slice', message:`seq=${seq} offset=${chunkOffset} len=${take} err=${String(err && err.message || err)}` });
+              throw err;
+            }
             written += ab.byteLength; pos += ab.byteLength;
           }
           served += len; if ((served & ((1<<22)-1)) === 0) send({ type: 'sw-log', phase: 'bytes', progress: served/total });
