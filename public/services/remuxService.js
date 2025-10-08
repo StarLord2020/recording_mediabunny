@@ -106,6 +106,76 @@ export function createStreamSourceForSession(index, options={}) {
   });
 }
 
+export function groupChunksByTargetSize(index, targetBytes) {
+  const groups = [];
+  let start = 0;
+  while (start < index.count) {
+    let size = 0; let end = start;
+    while (end < index.count && (size + index.sizes[end]) <= targetBytes) {
+      size += index.sizes[end];
+      end += 1;
+    }
+    if (end === start) { end = start + 1; size = index.sizes[start]; } // гарантируем хотя бы 1 чанк
+    groups.push({ startSeq: start, endSeq: end, totalSize: size });
+    start = end;
+  }
+  return groups;
+}
+
+export function createStreamSourceForChunkRange(index, startSeq, endSeq, options={}) {
+  const { StreamSource } = window.Mediabunny;
+  const maxCacheSize = Math.max(0, (options.cacheMB|0) * 1024 * 1024) || (128*1024*1024);
+  const prefetchProfile = options.prefetch || 'fileSystem';
+  const groupCount = Math.max(0, endSeq - startSeq);
+  const groupSizes = new Array(groupCount);
+  let total = 0;
+  for (let i = 0; i < groupCount; i++) { const sz = index.sizes[startSeq + i]; groupSizes[i] = sz; total += sz; }
+  const groupPrefix = new Array(groupCount); let acc = 0; for (let i = 0; i < groupCount; i++) { groupPrefix[i] = acc; acc += groupSizes[i]; }
+  let servedBytes = 0;
+  const locate = (offset) => locateChunkByOffset(groupPrefix, groupSizes, offset);
+  return new StreamSource({
+    getSize: () => total,
+    read: async (start, end) => {
+      const len = end - start; const out = new Uint8Array(len);
+      let written = 0; let pos = start;
+      while (written < len) {
+        const { seq, chunkOffset } = locate(pos);
+        const globalSeq = startSeq + seq;
+        const tx = index.db.transaction(CHUNKS,'readonly'); const store = tx.objectStore(CHUNKS);
+        // eslint-disable-next-line no-await-in-loop
+        const row = await new Promise((res, rej) => { const g = store.get([index.session.id, globalSeq]); g.onsuccess = () => res(g.result); g.onerror = () => rej(g.error); });
+        if (!row) throw new Error('Missing chunk');
+        const blob = row.blob || new Blob([row.ab], { type: index.mimeType });
+        const take = Math.min(blob.size - chunkOffset, len - written);
+        // eslint-disable-next-line no-await-in-loop
+        const ab = await blob.slice(chunkOffset, chunkOffset + take).arrayBuffer();
+        out.set(new Uint8Array(ab), written);
+        written += ab.byteLength; pos += ab.byteLength;
+      }
+      servedBytes += len;
+      try { options.onByteProgress?.(Math.max(0, Math.min(1, servedBytes / total))); } catch(_) {}
+      return out;
+    },
+    maxCacheSize,
+    prefetchProfile
+  });
+}
+
+export async function remuxChunkRangeToBlob(index, opts={}) {
+  const { Input, Output, WebMOutputFormat, BufferTarget, Conversion } = window.Mediabunny;
+  const source = createStreamSourceForChunkRange(index, opts.startSeq, opts.endSeq, { cacheMB: opts.cacheMB, prefetch: opts.prefetch, onByteProgress: opts.onByteProgress });
+  const input = new Input({ source, formats: [window.Mediabunny.WEBM] });
+  const target = new BufferTarget();
+  const output = new Output({ format: new WebMOutputFormat(), target });
+  const convOpts = { input, output };
+  if (opts.forceAudio) convOpts.audio = { forceTranscode: true };
+  if (opts.forceVideo) convOpts.video = { forceTranscode: true };
+  const conversion = await Conversion.init(convOpts);
+  conversion.onProgress = (p) => { opts.onProgress?.(Math.max(0, Math.min(1, p||0))); };
+  await conversion.execute();
+  return new Blob([target.buffer], { type: index.mimeType });
+}
+
 export async function computeSessionDuration(index, options={}) {
   const { Input } = window.Mediabunny;
   const source = createStreamSourceForSession(index, options);
