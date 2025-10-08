@@ -99,16 +99,20 @@
       progressLibBar.style.width = `${(v*100).toFixed(1)}%`;
       progressLibText.textContent = `3) Обработка (прогресс библиотеки): ${(v*100).toFixed(1)}%`;
     }
-    let finalizeTimer = null;
-    function startFinalize() {
-      if (finalizeTimer) return;
-      progressFinalBar.style.width = '5%';
-      progressFinalText.textContent = '4) Финализация записи: идёт…';
-      let w = 5;
+    let finalizeTimer = null; let finalizeStartTs = 0; let finalizeTotalMs = 1200;
+    function startFinalize(totalMs = 1200) {
+      resetFinalize();
+      finalizeTotalMs = Math.max(200, totalMs|0);
+      finalizeStartTs = performance.now();
+      progressFinalBar.style.width = '0%';
+      progressFinalText.textContent = '4) Финализация записи: 0%';
       finalizeTimer = setInterval(() => {
-        w += 3; if (w > 95) w = 10; // имитация движения
-        progressFinalBar.style.width = `${w}%`;
-      }, 150);
+        const elapsed = performance.now() - finalizeStartTs;
+        const v = Math.max(0, Math.min(1, elapsed / finalizeTotalMs));
+        progressFinalBar.style.width = `${(v*100).toFixed(1)}%`;
+        progressFinalText.textContent = `4) Финализация записи: ${(v*100).toFixed(1)}%`;
+        if (v >= 0.98) { clearInterval(finalizeTimer); finalizeTimer = null; }
+      }, 100);
     }
     function endFinalize() {
       if (finalizeTimer) { clearInterval(finalizeTimer); finalizeTimer = null; }
