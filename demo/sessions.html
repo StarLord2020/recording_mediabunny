@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Mediabunny — Сессии</title>
+  <script src="../dist/mediabunny.umd.js"></script>
+  <script src="./idb-recorder.js"></script>
+  <style>
+    body { font: 14px/1.4 system-ui, sans-serif; margin: 12px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap: wrap; margin: 8px 0; }
+    .progress { position: relative; width: 520px; height: 10px; background: #eee; border-radius: 6px; overflow: hidden; box-shadow: inset 0 1px 2px rgba(0,0,0,0.15); }
+    .progress__bar { height:100%; width:0%; background: linear-gradient(90deg,#4caf50,#2e7d32); transition: width 0.1s ease; }
+  </style>
+</head>
+<body>
+  <h2>📁 Обработка существующих сессий</h2>
+  <div class="row">
+    <select id="sessionSelect" style="min-width:420px;"></select>
+    <button id="refreshBtn">🔄 Обновить</button>
+    <button id="toFileBtn">💾 Сохранить в файл</button>
+    <button id="toBlobBtn">⬇ Скачать как файл</button>
+  </div>
+  <fieldset style="margin:8px 0; padding:8px; border:1px solid #ddd; border-radius:6px;">
+    <legend>Параметры</legend>
+    <div class="row">
+      <label>Cache (MB): <input id="cacheMB" type="number" min="0" step="16" value="128" style="width:100px;"></label>
+      <label>Prefetch: 
+        <select id="prefetch">
+          <option value="none">none</option>
+          <option value="fileSystem" selected>fileSystem</option>
+          <option value="network">network</option>
+        </select>
+      </label>
+      <label><input id="forceAudio" type="checkbox"> Audio forceTranscode</label>
+      <label><input id="forceVideo" type="checkbox"> Video forceTranscode</label>
+      <label>Pad (MB): <input id="padMB" type="number" min="0" step="100" value="0" style="width:100px;"></label>
+    </div>
+    <div class="row">
+      <div class="progress"><div class="progress__bar" id="progressBar"></div></div>
+      <div id="progressText">0%</div>
+    </div>
+  </fieldset>
+
+  <script type="module">
+    import { listSessionsSorted, remuxSessionToFile, remuxSessionToBlob } from './services/remuxService.js';
+
+    const selectEl = document.getElementById('sessionSelect');
+    const refreshBtn = document.getElementById('refreshBtn');
+    const toFileBtn = document.getElementById('toFileBtn');
+    const toBlobBtn = document.getElementById('toBlobBtn');
+    const cacheMBEl = document.getElementById('cacheMB');
+    const prefetchEl = document.getElementById('prefetch');
+    const forceAudioEl = document.getElementById('forceAudio');
+    const forceVideoEl = document.getElementById('forceVideo');
+    const padMBEl = document.getElementById('padMB');
+    const progressBar = document.getElementById('progressBar');
+    const progressText = document.getElementById('progressText');
+
+    function setProgress(p) {
+      const v = Math.max(0, Math.min(1, p||0));
+      progressBar.style.width = `${(v*100).toFixed(1)}%`;
+      progressText.textContent = `${(v*100).toFixed(1)}%`;
+    }
+
+    async function loadSessions() {
+      selectEl.innerHTML = '';
+      const sessions = await listSessionsSorted();
+      for (const s of sessions) {
+        const started = s.startedAt ? new Date(s.startedAt).toLocaleString() : 'без даты';
+        const opt = document.createElement('option');
+        opt.value = s.id;
+        opt.textContent = `${started} — ${s.chunkCount||0} чанков`;
+        opt.dataset.mime = s.mimeType || 'video/webm';
+        selectEl.appendChild(opt);
+      }
+    }
+
+    refreshBtn.onclick = loadSessions;
+    toFileBtn.onclick = async () => {
+      try {
+        const id = selectEl.value; if (!id) { alert('Выберите сессию'); return; }
+        if (!window.showSaveFilePicker) { alert('Нужен File System Access API'); return; }
+        const handle = await window.showSaveFilePicker({ suggestedName: `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`, types: [{ description:'WebM', accept: {'video/webm':['.webm']}}] });
+        setProgress(0);
+        await remuxSessionToFile(id, handle, {
+          cacheMB: Number(cacheMBEl.value||0),
+          prefetch: prefetchEl.value,
+          forceAudio: !!forceAudioEl.checked,
+          forceVideo: !!forceVideoEl.checked,
+          padMB: Number(padMBEl.value||0),
+          onProgress: setProgress
+        });
+        setProgress(1);
+        setTimeout(()=> setProgress(0), 800);
+      } catch (e) {
+        console.warn('toFile failed', e);
+        alert('Не удалось записать файл');
+      }
+    };
+    toBlobBtn.onclick = async () => {
+      try {
+        const id = selectEl.value; if (!id) { alert('Выберите сессию'); return; }
+        setProgress(0);
+        const blob = await remuxSessionToBlob(id, {
+          cacheMB: Number(cacheMBEl.value||0),
+          prefetch: prefetchEl.value,
+          forceAudio: !!forceAudioEl.checked,
+          forceVideo: !!forceVideoEl.checked,
+          onProgress: setProgress
+        });
+        const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `session-${new Date().toISOString().replace(/[:.]/g,'-')}.webm` });
+        document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 1500);
+        setProgress(1);
+        setTimeout(()=> setProgress(0), 800);
+      } catch (e) {
+        console.warn('toBlob failed', e);
+        alert('Не удалось собрать в Blob');
+      }
+    };
+
+    loadSessions();
+  </script>
+</body>
+</html>
+
