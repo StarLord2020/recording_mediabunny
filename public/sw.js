@@ -158,32 +158,52 @@ async function handleDownload(url, clientId) {
       send({ type: 'sw-error', message: String(e && e.message || e) });
       try { const writer = writable.getWriter?.(); await writer?.abort?.(e); } catch(_) {}
     }
-    const headers = new Headers({
-      'Content-Type': mimeType,
-      'Content-Disposition': `attachment; filename="${filename}"`,
-      'Cache-Control': 'no-store'
-    });
-    const readable = new ReadableStream({
-      async start(controller) {
-        try {
-          await convPromise;
-          const file = await fileHandle.getFile();
-          const reader = file.stream().getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
+      const respondWaitMs = Math.max(0, Number(url.searchParams.get('waitMs')||15000));
+      let finishedInTime = false;
+      try {
+        await Promise.race([
+          convPromise.then(()=>{ finishedInTime = true; }),
+          new Promise((_, rej) => setTimeout(()=>rej(new Error('timeout')), respondWaitMs))
+        ]);
+      } catch(_) {}
+
+      if (finishedInTime) {
+        const file = await fileHandle.getFile();
+        const headers = new Headers({
+          'Content-Type': mimeType,
+          'Content-Length': String(file.size),
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Cache-Control': 'no-store'
+        });
+        return new Response(file.stream(), { status: 200, headers });
+      }
+
+      const headers = new Headers({
+        'Content-Type': mimeType,
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Cache-Control': 'no-store'
+      });
+      const readable = new ReadableStream({
+        async start(controller) {
+          try {
+            await convPromise;
+            const file = await fileHandle.getFile();
+            const reader = file.stream().getReader();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              controller.enqueue(value);
+            }
+            controller.close();
+            try { await root.removeEntry(tmpName); } catch(_) {}
+          } catch (err) {
+            controller.error(err);
+            try { await root.removeEntry(tmpName); } catch(_) {}
           }
-          controller.close();
-          try { await root.removeEntry(tmpName); } catch(_) {}
-        } catch (err) {
-          controller.error(err);
-          try { await root.removeEntry(tmpName); } catch(_) {}
-        }
-      },
-      async cancel() { try { await root.removeEntry(tmpName); } catch(_) {} }
-    });
-    return new Response(readable, { status: 200, headers });
+        },
+        async cancel() { try { await root.removeEntry(tmpName); } catch(_) {} }
+      });
+      return new Response(readable, { status: 200, headers });
   } catch (err) {
     return new Response('SW init error: ' + String(err && err.message || err), { status: 500 });
   }

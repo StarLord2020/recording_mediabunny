@@ -162,7 +162,30 @@ async function handleDownload(url, clientId) {
         }
       })();
 
-      // Immediately return a streaming response; stream waits for conversion completion then reads file
+      // If conversion finishes quickly, respond with Content-Length to avoid browser buffering
+      const respondWaitMs = Math.max(0, Number(url.searchParams.get('waitMs')||15000));
+      let finishedInTime = false;
+      try {
+        await Promise.race([
+          convPromise.then(()=>{ finishedInTime = true; }),
+          new Promise((_, rej) => setTimeout(()=>rej(new Error('timeout')), respondWaitMs))
+        ]);
+      } catch(_) {}
+
+      if (finishedInTime) {
+        const file = await fileHandle.getFile();
+        const headers = new Headers({
+          'Content-Type': mimeType,
+          'Content-Length': String(file.size),
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Cache-Control': 'no-store'
+        });
+        const res = new Response(file.stream(), { status: 200, headers });
+        // Cleanup after download end is not directly observable here; best-effort cleanup next runs
+        return res;
+      }
+
+      // Otherwise, return immediately and stream after conversion completes (no Content-Length)
       const headers = new Headers({
         'Content-Type': mimeType,
         'Content-Disposition': `attachment; filename="${filename}"`,
