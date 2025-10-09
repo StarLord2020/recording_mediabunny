@@ -100,9 +100,10 @@ async function handleDownload(url, clientId) {
       };
       // Create random-access StreamSource
       // Tuning via URL params
-      const cacheMB = Math.max(1, Number(url.searchParams.get('cacheMB')||64));
-      const chunkMB = Math.max(1, Number(url.searchParams.get('chunkMB')||16));
-      const prefetch = url.searchParams.get('prefetch') || 'fileSystem';
+      // Conservative defaults to avoid RAM spikes; tune via URL if needed
+      const cacheMB = Math.max(1, Number(url.searchParams.get('cacheMB')||8));
+      const chunkMB = Math.max(1, Number(url.searchParams.get('chunkMB')||4));
+      const prefetch = url.searchParams.get('prefetch') || 'none';
 
       let served = 0;
       const source = new self.Mediabunny.StreamSource({
